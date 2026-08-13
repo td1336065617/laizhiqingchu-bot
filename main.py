@@ -4,7 +4,7 @@
 - 添加{关键词}        回复一条含图片的消息后触发，支持多图批量入库
 - 来只{关键词}        随机发送一张该关键词下的图片
 - 列表{关键词}{页码}   仅管理员，分页查看（每页 10 张）
-- 删图{关键词}{序号}   仅管理员，删除指定序号图片
+- 删图{关键词}        仅管理员，回复图片按 MD5 删除；或 删图{关键词}{序号} 按序号删除
 - 删除{关键词}        仅管理员，二次确认（60 秒）后删除整个关键词目录
 - 统计              仅管理员，查看关键词数、图片总数、Top 3
 - 菜单              所有人，查看指令与权限说明
@@ -423,15 +423,25 @@ class StickerPlugin(Star):
             yield event.plain_result("此指令仅限管理员")
             return
 
+        # 优先走“回复图片按 MD5 删除”：回复/同消息包含图片时，图片即删除依据
+        images = self._extract_reply_images(event)
+        if not images:
+            message_chain = getattr(event.message_obj, "message", None) or []
+            images = [c for c in message_chain if isinstance(c, Image)]
+        if images:
+            async for result in self._delete_by_md5(event, message_str, images):
+                yield result
+            return
+
         rest = message_str[2:].strip()
         match = re.search(r"(\d+)\s*$", rest)
         if not match:
-            yield event.plain_result("用法：删图{关键词}{序号}")
+            yield event.plain_result("用法：删图{关键词}（回复要删除的图片），或删图{关键词}{序号}")
             return
         keyword = rest[: match.start()].strip()
         index = int(match.group(1))
         if not keyword:
-            yield event.plain_result("用法：删图{关键词}{序号}")
+            yield event.plain_result("用法：删图{关键词}（回复要删除的图片），或删图{关键词}{序号}")
             return
         if not self._is_valid_keyword(keyword):
             yield event.plain_result("关键词不合法")
@@ -462,6 +472,86 @@ class StickerPlugin(Star):
             self.index.pop(keyword, None)
         self._save_index()
         yield event.plain_result(f"已删除第 {index} 张图片：{filename}")
+
+    async def _delete_by_md5(
+        self,
+        event: AstrMessageEvent,
+        message_str: str,
+        images: List[Image],
+    ):
+        """按回复图片的 MD5 删除指定关键词下的匹配图片（仅管理员）。"""
+        keyword = message_str[2:].strip()
+        if not keyword:
+            yield event.plain_result("用法：删图{关键词}（请回复要删除的图片）")
+            return
+        if not self._is_valid_keyword(keyword):
+            yield event.plain_result("关键词不合法")
+            return
+
+        folder = self.data_dir / keyword
+        if not folder.is_dir():
+            yield event.plain_result(f"关键词 {keyword} 下不存在图片")
+            return
+
+        # 计算回复图片的 MD5（支持一次回复多张图片）
+        target_md5s = set()
+        failed = 0
+        for img in images:
+            try:
+                tmp_path = Path(await img.convert_to_file_path())
+            except Exception as exc:
+                logger.error("图片本地化失败: %s", exc)
+                failed += 1
+                continue
+            if not tmp_path.is_file():
+                logger.warning("图片本地化后文件不存在: %s", tmp_path)
+                failed += 1
+                continue
+            try:
+                target_md5s.add(self._md5(tmp_path))
+            except OSError as exc:
+                logger.error("计算图片 MD5 失败: %s", exc)
+                failed += 1
+
+        if not target_md5s:
+            yield event.plain_result("删除失败：未能获取回复图片的内容")
+            return
+
+        # 在关键词目录中按 MD5 匹配（同 MD5 的多份文件会一并删除）
+        matched = []
+        for f in folder.iterdir():
+            if not f.is_file():
+                continue
+            try:
+                if self._md5(f) in target_md5s:
+                    matched.append(f)
+            except OSError:
+                continue
+
+        if not matched:
+            yield event.plain_result(
+                f"关键词 {keyword} 下没有与回复图片匹配的文件"
+            )
+            return
+
+        deleted = 0
+        failed_delete = 0
+        for f in matched:
+            try:
+                f.unlink()
+                deleted += 1
+            except OSError as exc:
+                logger.error("删除图片失败 %s: %s", f, exc)
+                failed_delete += 1
+
+        # 自修复：同步清理索引
+        self._prune_missing(keyword)
+        parts = [f"已按 MD5 删除 {deleted} 张图片（关键词 {keyword}）"]
+        if failed_delete:
+            parts.append(f"{failed_delete} 张删除失败")
+        if failed:
+            parts.append(f"{failed} 张回复图片未能读取")
+        yield event.plain_result("；".join(parts))
 
     # ------------------------------------------------------------------
     # E. 批量删除（仅管理员，60 秒二次确认）
@@ -550,6 +640,7 @@ class StickerPlugin(Star):
             "屏蔽列表 - 查看屏蔽关键词",
             "解除屏蔽{关键词} - 解除屏蔽",
             "列表{关键词}{页码} - 分页查看该关键词的图片（每页10张）",
+            "删图{关键词} - 回复图片，按 MD5 删除该关键词下的匹配图片",
             "删图{关键词}{序号} - 按序号删除单张图片",
             "删除{关键词} - 删除该关键词全部图片（60秒内二次确认）",
             "统计 - 查看关键词数、图片总数、图片数Top 3",

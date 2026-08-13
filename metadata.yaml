@@ -1,11 +1,12 @@
 name: sticker_plugin
 display_name: 表情包管理
-short_desc: QQ 群表情包管理：添加、随机发送、列表、删除、统计
+short_desc: QQ 群表情包管理：添加、随机发送、MD5 精准删除、备份恢复
 desc: |
   通过“回复包含图片的消息”添加表情包，支持关键词管理、随机发送、
-  分页列表、精准删除与二次确认批量删除、存储统计与超容量警告。
-  数据保存在 data/stickers/ 目录下。
-version: 1.0.0
+  分页列表、回复图片按 MD5 精准删除、按序号删除、二次确认批量删除、
+  屏蔽关键词、存储统计与超容量警告；备份/恢复/管理员设置可在
+  AstrBot WebUI 的“表情包管理”页完成。数据保存在 data/stickers/ 目录下。
+version: 1.1.0
 author: td1336065617
 repo: https://github.com/td1336065617/laizhiqingchu-bot
 astrbot_version: ">=4.13.0"
