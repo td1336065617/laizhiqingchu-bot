@@ -72,10 +72,50 @@ def _resolve_data_dir() -> Path:
     return base / "stickers"
 
 
+def _resolve_config_path() -> Path:
+    """插件自管理配置路径，与 AstrBot 原生插件配置位置一致。"""
+    try:
+        from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+        base = Path(get_astrbot_data_path())
+    except Exception:
+        base = Path("data")
+    return base / "config" / "sticker_plugin_config.json"
+
+
+class _PluginConfig(dict):
+    """无 _conf_schema.json 时插件自管理的配置对象，读写 data/config 下的配置文件。"""
+
+    def __init__(self, config_path: Path):
+        super().__init__()
+        self.config_path = config_path
+        try:
+            if config_path.is_file():
+                with open(config_path, encoding="utf-8-sig") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self.update(data)
+        except Exception as exc:
+            logger.error("加载插件配置失败: %s", exc)
+
+    def save_config(self) -> None:
+        try:
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(self, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.error("保存插件配置失败: %s", exc)
+            raise
+
+
 class StickerPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
         super().__init__(context)
-        self.config = config
+        # 插件不再提供 _conf_schema.json（与内置插件一致，后台集中在 WebUI 页面）；
+        # AstrBot 此时不会传入 config，插件自行读写配置文件。
+        self.config = config if isinstance(config, dict) else _PluginConfig(
+            _resolve_config_path()
+        )
         self.data_dir = _resolve_data_dir()
         self.index_path = self.data_dir / "index.json"
         self.backup_root = self.data_dir.parent / "sticker_backups"

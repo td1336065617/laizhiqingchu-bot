@@ -23,7 +23,7 @@
 ## 配置
 
 管理员列表与存储上限统一在 **AstrBot 管理面板 → 插件管理 → 表情包管理** 页面中
-维护（插件原生配置页仅显示前往该页面的提示，不再提供设置项）。保存后立即生效。
+维护（插件不提供 AstrBot 原生配置表单，与内置插件一致）。保存后立即生效。
 
 ## 存储结构
 
@@ -69,5 +69,5 @@ data/sticker_backups/        # WebUI 备份产生的压缩包
 
 ## 部署
 
-将本目录（`metadata.yaml`、`main.py`、`_conf_schema.json`、`pages/`）放入
+将本目录（`metadata.yaml`、`main.py`、`pages/`）放入
 `AstrBot/data/plugins/sticker_plugin/`，然后在 WebUI 插件管理页启用并重载插件。
