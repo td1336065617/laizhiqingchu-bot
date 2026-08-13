@@ -4,7 +4,7 @@
 - 添加{关键词}        回复一条含图片的消息后触发，支持多图批量入库
 - 来只{关键词}        随机发送一张该关键词下的图片
 - 列表{关键词}{页码}   仅管理员，分页查看（每页 10 张）
-- 删图{关键词}        仅管理员，回复图片按 MD5 删除；或 删图{关键词}{序号} 按序号删除
+- 删图                仅管理员，回复图片按 MD5 自动定位删除；或 删图{关键词}{序号} 按序号删除
 - 删除{关键词}        仅管理员，二次确认（60 秒）后删除整个关键词目录
 - 统计              仅管理员，查看关键词数、图片总数、Top 3
 - 菜单              所有人，查看指令与权限说明
@@ -436,12 +436,12 @@ class StickerPlugin(Star):
         rest = message_str[2:].strip()
         match = re.search(r"(\d+)\s*$", rest)
         if not match:
-            yield event.plain_result("用法：删图{关键词}（回复要删除的图片），或删图{关键词}{序号}")
+            yield event.plain_result("用法：删图（回复要删除的图片），或删图{关键词}{序号}")
             return
         keyword = rest[: match.start()].strip()
         index = int(match.group(1))
         if not keyword:
-            yield event.plain_result("用法：删图{关键词}（回复要删除的图片），或删图{关键词}{序号}")
+            yield event.plain_result("用法：删图（回复要删除的图片），或删图{关键词}{序号}")
             return
         if not self._is_valid_keyword(keyword):
             yield event.plain_result("关键词不合法")
@@ -479,18 +479,30 @@ class StickerPlugin(Star):
         message_str: str,
         images: List[Image],
     ):
-        """按回复图片的 MD5 删除指定关键词下的匹配图片（仅管理员）。"""
+        """按回复图片的 MD5 删除匹配图片（仅管理员）。
+
+        不带关键词时自动在所有关键词中定位；带关键词时仅在该关键词下删除。
+        """
         keyword = message_str[2:].strip()
-        if not keyword:
-            yield event.plain_result("用法：删图{关键词}（请回复要删除的图片）")
-            return
-        if not self._is_valid_keyword(keyword):
+        if keyword and not self._is_valid_keyword(keyword):
             yield event.plain_result("关键词不合法")
             return
 
-        folder = self.data_dir / keyword
-        if not folder.is_dir():
-            yield event.plain_result(f"关键词 {keyword} 下不存在图片")
+        # 待扫描的关键词目录：限定关键词，或全部已索引关键词
+        if keyword:
+            folders = [(keyword, self.data_dir / keyword)]
+        else:
+            folders = [
+                (k, self.data_dir / k)
+                for k in self.index
+                if (self.data_dir / k).is_dir()
+            ]
+        if not folders:
+            yield event.plain_result(
+                f"关键词 {keyword} 下不存在图片"
+                if keyword
+                else "表情包库中还没有任何关键词"
+            )
             return
 
         # 计算回复图片的 MD5（支持一次回复多张图片）
@@ -517,36 +529,47 @@ class StickerPlugin(Star):
             yield event.plain_result("删除失败：未能获取回复图片的内容")
             return
 
-        # 在关键词目录中按 MD5 匹配（同 MD5 的多份文件会一并删除）
-        matched = []
-        for f in folder.iterdir():
-            if not f.is_file():
+        # 在各关键词目录中按 MD5 匹配（同 MD5 的多份文件会一并删除）
+        deleted = 0
+        failed_delete = 0
+        deleted_by_keyword = {}
+        for kw, folder in folders:
+            matched = []
+            for f in folder.iterdir():
+                if not f.is_file():
+                    continue
+                try:
+                    if self._md5(f) in target_md5s:
+                        matched.append(f)
+                except OSError:
+                    continue
+            if not matched:
                 continue
-            try:
-                if self._md5(f) in target_md5s:
-                    matched.append(f)
-            except OSError:
-                continue
+            for f in matched:
+                try:
+                    f.unlink()
+                    deleted += 1
+                except OSError as exc:
+                    logger.error("删除图片失败 %s: %s", f, exc)
+                    failed_delete += 1
+            self._prune_missing(kw)
+            deleted_by_keyword[kw] = len(matched)
 
-        if not matched:
+        if deleted == 0 and failed_delete == 0:
             yield event.plain_result(
                 f"关键词 {keyword} 下没有与回复图片匹配的文件"
+                if keyword
+                else "该图未在表情包库中找到，未删除任何文件"
             )
             return
 
-        deleted = 0
-        failed_delete = 0
-        for f in matched:
-            try:
-                f.unlink()
-                deleted += 1
-            except OSError as exc:
-                logger.error("删除图片失败 %s: %s", f, exc)
-                failed_delete += 1
-
-        # 自修复：同步清理索引
-        self._prune_missing(keyword)
-        parts = [f"已按 MD5 删除 {deleted} 张图片（关键词 {keyword}）"]
+        if keyword:
+            parts = [f"已按 MD5 删除 {deleted} 张图片（关键词 {keyword}）"]
+        else:
+            summary = "、".join(
+                f"{kw} {n} 张" for kw, n in deleted_by_keyword.items()
+            )
+            parts = [f"已按 MD5 删除 {deleted} 张图片（{summary}）"]
         if failed_delete:
             parts.append(f"{failed_delete} 张删除失败")
         if failed:
@@ -640,7 +663,8 @@ class StickerPlugin(Star):
             "屏蔽列表 - 查看屏蔽关键词",
             "解除屏蔽{关键词} - 解除屏蔽",
             "列表{关键词}{页码} - 分页查看该关键词的图片（每页10张）",
-            "删图{关键词} - 回复图片，按 MD5 删除该关键词下的匹配图片",
+            "删图 - 回复图片，按 MD5 自动定位并删除该图（可不带关键词）",
+            "删图{关键词} - 回复图片，仅在该关键词下按 MD5 删除",
             "删图{关键词}{序号} - 按序号删除单张图片",
             "删除{关键词} - 删除该关键词全部图片（60秒内二次确认）",
             "统计 - 查看关键词数、图片总数、图片数Top 3",
