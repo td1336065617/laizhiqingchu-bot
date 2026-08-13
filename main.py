@@ -170,6 +170,12 @@ class StickerPlugin(Star):
                 ["POST"],
                 "保存插件后台配置（管理员列表/存储上限）",
             )
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/clear",
+                self._web_clear,
+                ["POST"],
+                "清空全部表情包数据",
+            )
         except Exception as exc:
             logger.error("StickerPlugin 注册 Web API 失败: %s", exc)
 
@@ -698,6 +704,38 @@ class StickerPlugin(Star):
             except OSError:
                 pass
         return json_response({"status": "success", "data": stats})
+
+    async def _web_clear(self):
+        """清空全部表情包数据（删除所有关键词目录与索引，不影响管理员/屏蔽列表）。"""
+        try:
+            cleared_keywords = len(self.index)
+            cleared_images = sum(
+                len(names)
+                for names in self.index.values()
+                if isinstance(names, list)
+            )
+            for child in list(self.data_dir.iterdir()):
+                if child.is_dir():
+                    shutil.rmtree(child)
+            self.index.clear()
+            self.pending_delete.clear()
+            self._save_index()
+        except Exception as exc:
+            logger.error("清空表情包失败: %s", exc, exc_info=True)
+            return error_response(f"清空失败：{exc}")
+        return json_response(
+            {
+                "status": "success",
+                "data": {
+                    "cleared_keywords": cleared_keywords,
+                    "cleared_images": cleared_images,
+                    "message": (
+                        f"已清空 {cleared_keywords} 个关键词、"
+                        f"{cleared_images} 张图片"
+                    ),
+                },
+            }
+        )
 
     def _backup_to_zip(self) -> dict:
         """把当前全部表情包数据打包为 zip（含 manifest 校验清单）。"""

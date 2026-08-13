@@ -50,6 +50,8 @@ data/sticker_backups/        # WebUI 备份产生的压缩包
 - **恢复**：上传 zip 后先校验压缩包完整性、`index.json`/`manifest.json` 一致性、
   路径安全性与文件齐全性；校验通过后**合并式恢复**——重叠图片按 MD5 跳过，
   结果会显示归档关键词数/图片数、新增、覆盖、跳过重复、失败数量。
+- **清空**：二次确认后删除全部关键词与图片（不可恢复，建议先备份）；
+  不影响管理员设置与屏蔽列表。
 
 数据目录按 AstrBot 官方规范优先解析 `get_astrbot_data_path()`，最终为
 `<AstrBot数据目录>/stickers`（即通常的 `data/stickers/`）。

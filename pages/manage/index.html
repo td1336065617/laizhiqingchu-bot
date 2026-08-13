@@ -46,7 +46,7 @@
     <input type="number" id="mbInput" min="1">
     <button id="btnSaveConfig">保存配置</button>
   </div>
-  <div class="muted" style="margin-top:8px">管理员列表与存储上限保存后会立即生效（热重载插件配置）。</div>
+  <div class="muted" style="margin-top:8px">添加/移除管理员会自动保存并立即生效；存储上限修改后点“保存配置”。</div>
 </div>
 
 <div class="card">
@@ -66,6 +66,14 @@
   </table>
 </div>
 
+<div class="card">
+  <h2>清空表情包</h2>
+  <div class="row">
+    <button id="btnClear" class="danger">清空表情包</button>
+    <span class="muted">删除全部关键词与图片，不可恢复（建议先备份）；不影响管理员设置与屏蔽列表。</span>
+  </div>
+</div>
+
 <script>
 (function () {
   const A = window.AstrBotPluginPage;
@@ -74,6 +82,8 @@
   const backupBody = document.getElementById('backupBody');
   let adminUsers = [];
   let maxStorageMb = 200;
+  let clearArmed = false;
+  let clearTimer = null;
 
   function show(text, isError) {
     result.style.display = 'block';
@@ -100,10 +110,36 @@
       const btn = document.createElement('button');
       btn.className = 'danger';
       btn.textContent = '移除';
-      btn.onclick = () => { adminUsers = adminUsers.filter(x => x !== id); renderAdmins(); };
+      btn.onclick = async () => {
+        adminUsers = adminUsers.filter(x => x !== id);
+        renderAdmins();
+        try {
+          const mb = Number(document.getElementById('mbInput').value) || maxStorageMb;
+          await A.apiPost('config', { admin_users: adminUsers, max_storage_mb: mb });
+          show('管理员已移除并保存');
+        } catch (e) {
+          show('保存失败：' + (e && e.message ? e.message : e), true);
+        }
+      };
       td2.appendChild(btn);
       tr.append(td1, td2);
       adminBody.appendChild(tr);
+    }
+  }
+
+  async function addAdmin() {
+    const input = document.getElementById('adminInput');
+    const value = input.value.trim();
+    if (!value) return;
+    if (!adminUsers.includes(value)) adminUsers.push(value);
+    input.value = '';
+    renderAdmins();
+    try {
+      const mb = Number(document.getElementById('mbInput').value) || maxStorageMb;
+      await A.apiPost('config', { admin_users: adminUsers, max_storage_mb: mb });
+      show('管理员已添加并保存');
+    } catch (e) {
+      show('保存失败：' + (e && e.message ? e.message : e), true);
     }
   }
 
@@ -147,17 +183,18 @@
     }
   }
 
-  document.getElementById('btnAddAdmin').onclick = () => {
-    const input = document.getElementById('adminInput');
-    const value = input.value.trim();
-    if (!value) return;
-    if (!adminUsers.includes(value)) adminUsers.push(value);
-    input.value = '';
-    renderAdmins();
-  };
+  document.getElementById('btnAddAdmin').onclick = addAdmin;
+  document.getElementById('adminInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') addAdmin();
+  });
 
   document.getElementById('btnSaveConfig').onclick = async () => {
     try {
+      const input = document.getElementById('adminInput');
+      const value = input.value.trim();
+      if (value && !adminUsers.includes(value)) adminUsers.push(value);
+      input.value = '';
+      renderAdmins();
       const mb = Number(document.getElementById('mbInput').value);
       const r = await A.apiPost('config', { admin_users: adminUsers, max_storage_mb: mb });
       show('配置已保存并生效');
@@ -188,6 +225,28 @@
       refreshBackups();
     } catch (e) {
       show('恢复失败：' + (e && e.message ? e.message : e), true);
+    }
+  };
+
+  document.getElementById('btnClear').onclick = async () => {
+    const btn = document.getElementById('btnClear');
+    if (!clearArmed) {
+      clearArmed = true;
+      btn.textContent = '再次点击确认清空';
+      clearTimer = setTimeout(() => {
+        clearArmed = false;
+        btn.textContent = '清空表情包';
+      }, 5000);
+      return;
+    }
+    clearTimeout(clearTimer);
+    clearArmed = false;
+    btn.textContent = '清空表情包';
+    try {
+      const r = await A.apiPost('clear');
+      show((r && r.message) || JSON.stringify(r));
+    } catch (e) {
+      show('清空失败：' + (e && e.message ? e.message : e), true);
     }
   };
 
