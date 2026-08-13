@@ -53,6 +53,14 @@ data/sticker_backups/        # WebUI 备份产生的压缩包
 - **清空**：二次确认后删除全部关键词与图片（不可恢复，建议先备份）；
   不影响管理员设置与屏蔽列表。
 
+## 备份格式与迁移
+
+备份/恢复**不依赖任何第三方 SDK 或云服务**：打包与解压使用 Python 标准库
+`zipfile`，WebUI 页面的上传/下载走 AstrBot 自带的插件页面桥接接口，安装后
+开箱即用。备份文件是标准 zip，内含 `index.json`、`blocked_keywords.json`、
+全部图片和 `manifest.json` 校验清单，可直接复制到其他机器；在另一台 AstrBot
+部署本插件后，打开“表情包管理”页上传该 zip 即可合并导入（重叠图片按 MD5 跳过）。
+
 数据目录按 AstrBot 官方规范优先解析 `get_astrbot_data_path()`，最终为
 `<AstrBot数据目录>/stickers`（即通常的 `data/stickers/`）。
 
