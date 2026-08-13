@@ -3,11 +3,13 @@
     "description": "插件管理员QQ号列表（在机器人后台添加，非QQ群角色）",
     "type": "list",
     "default": [],
-    "hint": "填写拥有管理权限的QQ号，如 [\"123456789\", \"987654321\"]"
+    "hint": "填写拥有管理权限的QQ号，如 [\"123456789\", \"987654321\"]",
+    "invisible": true
   },
   "max_storage_mb": {
     "description": "最大存储容量（MB），超过后台警告",
     "type": "int",
-    "default": 200
+    "default": 200,
+    "invisible": true
   }
 }

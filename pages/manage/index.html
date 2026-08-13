@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>表情包管理</title>
+<script src="/api/plugin/page/bridge-sdk.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, "Microsoft YaHei", sans-serif; margin: 0; padding: 24px; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  h2 { font-size: 16px; margin: 0 0 10px; }
+  .card { border: 1px solid rgba(128,128,128,.25); border-radius: 10px; padding: 16px 20px; margin-bottom: 18px; background: rgba(128,128,128,.06); }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button { padding: 8px 18px; border: 0; border-radius: 8px; background: #3b82f6; color: #fff; cursor: pointer; font-size: 14px; }
+  button:hover { opacity: .9; }
+  button.secondary { background: #6b7280; }
+  button.danger { background: #dc2626; }
+  input[type=text], input[type=number], input[type=file] { font-size: 14px; padding: 7px 10px; border: 1px solid rgba(128,128,128,.35); border-radius: 8px; background: transparent; color: inherit; }
+  input[type=number] { width: 120px; }
+  #result { display: none; margin-bottom: 18px; padding: 10px 12px; border-radius: 8px; background: rgba(34,197,94,.12); color: #16a34a; white-space: pre-wrap; font-size: 14px; }
+  #result.error { background: rgba(239,68,68,.12); color: #dc2626; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid rgba(128,128,128,.2); }
+  th { font-weight: 600; }
+  .muted { color: #888; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>表情包管理后台</h1>
+
+<div id="result"></div>
+
+<div class="card">
+  <h2>管理员设置</h2>
+  <div class="row" style="margin-bottom:10px">
+    <input type="text" id="adminInput" placeholder="输入管理员 QQ号 / openid">
+    <button id="btnAddAdmin">添加</button>
+  </div>
+  <table>
+    <thead><tr><th>管理员 ID</th><th>操作</th></tr></thead>
+    <tbody id="adminBody"></tbody>
+  </table>
+  <div class="row" style="margin-top:14px">
+    <label>存储上限（MB）</label>
+    <input type="number" id="mbInput" min="1">
+    <button id="btnSaveConfig">保存配置</button>
+  </div>
+  <div class="muted" style="margin-top:8px">管理员列表与存储上限保存后会立即生效（热重载插件配置）。</div>
+</div>
+
+<div class="card">
+  <h2>备份与恢复</h2>
+  <div class="row" style="margin-bottom:12px">
+    <button id="btnBackup">立即备份（打包 zip）</button>
+    <span class="muted">将全部关键词与图片打包，含数据校验清单</span>
+  </div>
+  <div class="row" style="margin-bottom:12px">
+    <input type="file" id="fileInput" accept=".zip">
+    <button id="btnRestore">上传并恢复</button>
+  </div>
+  <div class="muted" style="margin-bottom:10px">恢复为合并式：重叠图片按 MD5 自动跳过；结果显示新增 / 覆盖 / 跳过 / 失败数量。</div>
+  <table>
+    <thead><tr><th>备份文件</th><th>大小</th><th>创建时间</th><th>操作</th></tr></thead>
+    <tbody id="backupBody"></tbody>
+  </table>
+</div>
+
+<script>
+(function () {
+  const A = window.AstrBotPluginPage;
+  const result = document.getElementById('result');
+  const adminBody = document.getElementById('adminBody');
+  const backupBody = document.getElementById('backupBody');
+  let adminUsers = [];
+  let maxStorageMb = 200;
+
+  function show(text, isError) {
+    result.style.display = 'block';
+    result.textContent = text;
+    result.className = isError ? 'error' : '';
+  }
+
+  function fmtSize(bytes) {
+    if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+    if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return bytes + ' B';
+  }
+
+  function renderAdmins() {
+    adminBody.innerHTML = '';
+    if (!adminUsers.length) {
+      adminBody.innerHTML = '<tr><td colspan="2" class="muted">暂无管理员，请添加</td></tr>';
+      return;
+    }
+    for (const id of adminUsers) {
+      const tr = document.createElement('tr');
+      const td1 = document.createElement('td'); td1.textContent = id;
+      const td2 = document.createElement('td');
+      const btn = document.createElement('button');
+      btn.className = 'danger';
+      btn.textContent = '移除';
+      btn.onclick = () => { adminUsers = adminUsers.filter(x => x !== id); renderAdmins(); };
+      td2.appendChild(btn);
+      tr.append(td1, td2);
+      adminBody.appendChild(tr);
+    }
+  }
+
+  async function loadConfig() {
+    try {
+      const r = await A.apiGet('config');
+      adminUsers = (r && Array.isArray(r.admin_users) ? r.admin_users : []).slice();
+      maxStorageMb = (r && r.max_storage_mb) || 200;
+      document.getElementById('mbInput').value = maxStorageMb;
+      renderAdmins();
+    } catch (e) {
+      show('加载配置失败：' + (e && e.message ? e.message : e), true);
+    }
+  }
+
+  async function refreshBackups() {
+    try {
+      const r = await A.apiGet('backups');
+      const list = (r && Array.isArray(r.backups) ? r.backups : []) || [];
+      backupBody.innerHTML = '';
+      if (!list.length) {
+        backupBody.innerHTML = '<tr><td colspan="4" class="muted">暂无备份</td></tr>';
+        return;
+      }
+      for (const item of list) {
+        const tr = document.createElement('tr');
+        const td1 = document.createElement('td'); td1.textContent = item.filename;
+        const td2 = document.createElement('td'); td2.textContent = fmtSize(item.size);
+        const td3 = document.createElement('td'); td3.textContent = item.created || '-';
+        const td4 = document.createElement('td');
+        const btn = document.createElement('button');
+        btn.className = 'secondary';
+        btn.textContent = '下载';
+        btn.onclick = () => A.download('backup/download', { name: item.filename }, item.filename);
+        td4.appendChild(btn);
+        tr.append(td1, td2, td3, td4);
+        backupBody.appendChild(tr);
+      }
+    } catch (e) {
+      show('加载备份列表失败：' + (e && e.message ? e.message : e), true);
+    }
+  }
+
+  document.getElementById('btnAddAdmin').onclick = () => {
+    const input = document.getElementById('adminInput');
+    const value = input.value.trim();
+    if (!value) return;
+    if (!adminUsers.includes(value)) adminUsers.push(value);
+    input.value = '';
+    renderAdmins();
+  };
+
+  document.getElementById('btnSaveConfig').onclick = async () => {
+    try {
+      const mb = Number(document.getElementById('mbInput').value);
+      const r = await A.apiPost('config', { admin_users: adminUsers, max_storage_mb: mb });
+      show('配置已保存并生效');
+      await loadConfig();
+    } catch (e) {
+      show('保存配置失败：' + (e && e.message ? e.message : e), true);
+    }
+  };
+
+  document.getElementById('btnBackup').onclick = async () => {
+    try {
+      show('正在备份...');
+      const r = await A.apiGet('backup');
+      show((r && r.message) || JSON.stringify(r));
+      refreshBackups();
+    } catch (e) {
+      show('备份失败：' + (e && e.message ? e.message : e), true);
+    }
+  };
+
+  document.getElementById('btnRestore').onclick = async () => {
+    const file = document.getElementById('fileInput').files[0];
+    if (!file) { show('请先选择备份压缩包', true); return; }
+    try {
+      show('正在恢复...');
+      const r = await A.upload('restore', file);
+      show(r && r.message ? r.message : JSON.stringify(r));
+      refreshBackups();
+    } catch (e) {
+      show('恢复失败：' + (e && e.message ? e.message : e), true);
+    }
+  };
+
+  A.ready().then(() => { loadConfig(); refreshBackups(); });
+})();
+</script>
+</body>
+</html>

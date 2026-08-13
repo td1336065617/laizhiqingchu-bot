@@ -8,6 +8,11 @@
 - 删除{关键词}        仅管理员，二次确认（60 秒）后删除整个关键词目录
 - 统计              仅管理员，查看关键词数、图片总数、Top 3
 - 菜单              所有人，查看指令与权限说明
+- 屏蔽{关键词}       仅管理员，屏蔽关键词（禁止添加）
+- 屏蔽列表          仅管理员，查看屏蔽关键词列表
+- 解除屏蔽{关键词}    仅管理员，解除关键词屏蔽
+
+WebUI 后台：在 AstrBot 插件页面的“表情包管理”页中统一管理管理员、存储上限与备份恢复。
 
 数据存储：
 - data/stickers/index.json           关键词 -> 文件名列表索引
@@ -20,6 +25,7 @@ import random
 import re
 import shutil
 import time
+import zipfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -27,9 +33,24 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Reply
 from astrbot.api.star import Context, Star
+from astrbot.api.web import error_response, file_response, json_response, request
+
+# 与 metadata.yaml 的 name 保持一致；注册的 Web API 路由必须带插件名前缀
+PLUGIN_NAME = "sticker_plugin"
 
 # 与指令名重名的关键词一律不合法
-RESERVED_KEYWORDS = {"添加", "来只", "列表", "删图", "删除", "统计", "菜单"}
+RESERVED_KEYWORDS = {
+    "添加",
+    "来只",
+    "列表",
+    "删图",
+    "删除",
+    "统计",
+    "菜单",
+    "屏蔽",
+    "屏蔽列表",
+    "解除屏蔽",
+}
 # 二次删除确认的有效期（秒）
 CONFIRM_TTL = 60
 # 列表分页大小
@@ -57,16 +78,60 @@ class StickerPlugin(Star):
         self.config = config
         self.data_dir = _resolve_data_dir()
         self.index_path = self.data_dir / "index.json"
+        self.backup_root = self.data_dir.parent / "sticker_backups"
+        self.blocked_path = self.data_dir / "blocked_keywords.json"
         # 索引结构：{"关键词": ["文件名1.png", ...]}
         self.index: dict = {}
         # 批量删除二次确认：{user_id: {"keyword": str, "time": float}}
         self.pending_delete: dict = {}
+        # 屏蔽关键词集合
+        self.blocked_keywords: set = set()
         self._load_index()
+        self._load_blocked()
         self._check_storage()
         logger.info(
             "StickerPlugin 管理员列表: %s",
             [str(a) for a in (self.config.get("admin_users", []) or [])],
         )
+        try:
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/backup",
+                self._web_backup,
+                ["GET"],
+                "表情包数据备份（生成压缩包）",
+            )
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/backups",
+                self._web_backups,
+                ["GET"],
+                "表情包备份列表",
+            )
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/backup/download",
+                self._web_download,
+                ["GET"],
+                "下载表情包备份压缩包",
+            )
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/restore",
+                self._web_restore,
+                ["POST"],
+                "上传表情包备份压缩包并恢复",
+            )
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/config",
+                self._web_config_get,
+                ["GET"],
+                "获取插件后台配置（管理员列表/存储上限）",
+            )
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/config",
+                self._web_config_set,
+                ["POST"],
+                "保存插件后台配置（管理员列表/存储上限）",
+            )
+        except Exception as exc:
+            logger.error("StickerPlugin 注册 Web API 失败: %s", exc)
 
     # ------------------------------------------------------------------
     # 统一入口：精确前缀分发，未匹配的指令完全无视、不回复
@@ -137,6 +202,15 @@ class StickerPlugin(Star):
             elif message_str.startswith("菜单"):
                 async for result in self._handle_menu(event, message_str):
                     yield result
+            elif message_str.startswith("屏蔽列表"):
+                async for result in self._handle_block_list(event, message_str):
+                    yield result
+            elif message_str.startswith("解除屏蔽"):
+                async for result in self._handle_unblock(event, message_str):
+                    yield result
+            elif message_str.startswith("屏蔽"):
+                async for result in self._handle_block(event, message_str):
+                    yield result
             # 其余消息：完全忽略
         except Exception as exc:
             logger.error("StickerPlugin 处理消息异常: %s", exc, exc_info=True)
@@ -174,6 +248,9 @@ class StickerPlugin(Star):
             return
         if not self._is_valid_keyword(keyword):
             yield event.plain_result("关键词不合法")
+            return
+        if keyword in self.blocked_keywords:
+            yield event.plain_result(f"关键词 {keyword} 已被屏蔽，无法添加")
             return
 
         folder = self.data_dir / keyword
@@ -423,12 +500,379 @@ class StickerPlugin(Star):
             "来只{关键词} - 随机发送一张该关键词的图片",
             "菜单 - 显示本菜单",
             "【仅管理员】",
+            "屏蔽{关键词} - 屏蔽关键词，禁止添加",
+            "屏蔽列表 - 查看屏蔽关键词",
+            "解除屏蔽{关键词} - 解除屏蔽",
             "列表{关键词}{页码} - 分页查看该关键词的图片（每页10张）",
             "删图{关键词}{序号} - 按序号删除单张图片",
             "删除{关键词} - 删除该关键词全部图片（60秒内二次确认）",
             "统计 - 查看关键词数、图片总数、图片数Top 3",
+            "备份/恢复/管理员设置 - 请在 AstrBot WebUI 插件页面的“表情包管理”页操作",
         ]
         yield event.plain_result("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # G. WebUI 备份 / 恢复（AstrBot 管理面板后台）
+    # ------------------------------------------------------------------
+    async def _web_config_get(self):
+        return json_response(
+            {
+                "status": "success",
+                "data": {
+                    "admin_users": [
+                        str(a) for a in (self.config.get("admin_users", []) or [])
+                    ],
+                    "max_storage_mb": self._max_storage_mb(),
+                },
+            }
+        )
+
+    async def _web_config_set(self):
+        payload = await request.json(default=None)
+        if not isinstance(payload, dict):
+            return error_response("请求体格式不正确")
+        try:
+            updated = self._apply_config_payload(payload)
+        except ValueError as exc:
+            return error_response(str(exc))
+        return json_response({"status": "success", "data": updated})
+
+    def _max_storage_mb(self) -> int:
+        try:
+            return int(
+                self.config.get("max_storage_mb", DEFAULT_MAX_STORAGE_MB)
+                or DEFAULT_MAX_STORAGE_MB
+            )
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_STORAGE_MB
+
+    def _apply_config_payload(self, payload: dict) -> dict:
+        """校验并保存后台配置，返回实际更新的字段。"""
+        updated: dict = {}
+        if "admin_users" in payload:
+            admins = payload["admin_users"]
+            if not isinstance(admins, list):
+                raise ValueError("admin_users 必须是列表")
+            normalized: list = []
+            for item in admins:
+                text = str(item).strip()
+                if text and text not in normalized:
+                    normalized.append(text)
+            self.config["admin_users"] = normalized
+            updated["admin_users"] = normalized
+        if "max_storage_mb" in payload:
+            try:
+                limit = int(payload["max_storage_mb"])
+            except (TypeError, ValueError):
+                raise ValueError("max_storage_mb 必须是整数")
+            if limit <= 0:
+                raise ValueError("max_storage_mb 必须大于 0")
+            self.config["max_storage_mb"] = limit
+            updated["max_storage_mb"] = limit
+        try:
+            self.config.save_config()
+        except Exception as exc:
+            logger.error("保存插件配置失败: %s", exc)
+            raise ValueError(f"保存配置失败：{exc}") from exc
+        return updated
+
+    async def _web_backup(self):
+        """生成备份压缩包：data/stickers -> zip（含 index/blocked/manifest 校验清单）。"""
+        try:
+            info = self._backup_to_zip()
+        except Exception as exc:
+            logger.error("备份失败: %s", exc, exc_info=True)
+            return error_response(f"备份失败：{exc}")
+        return json_response(
+            {
+                "status": "success",
+                "data": {
+                    "filename": info["filename"],
+                    "keywords": info["keywords"],
+                    "images": info["images"],
+                    "size": info["size"],
+                    "message": (
+                        f"备份完成：{info['keywords']} 个关键词，"
+                        f"{info['images']} 张图片，{info['size'] / 1024:.1f} KB"
+                    ),
+                },
+            }
+        )
+
+    async def _web_backups(self):
+        items = []
+        try:
+            for p in sorted(
+                self.backup_root.glob("sticker_backup_*.zip"), reverse=True
+            ):
+                st = p.stat()
+                items.append(
+                    {
+                        "filename": p.name,
+                        "size": st.st_size,
+                        "created": time.strftime(
+                            "%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)
+                        ),
+                    }
+                )
+        except OSError as exc:
+            logger.error("读取备份列表失败: %s", exc)
+            return error_response(f"读取备份列表失败：{exc}")
+        return json_response({"status": "success", "data": {"backups": items}})
+
+    async def _web_download(self):
+        name = request.query.get("name", "")
+        if not name:
+            return error_response("缺少备份文件名")
+        # 防止路径穿越：只允许 sticker_backups 目录内、名为原文件名的 zip
+        target = (self.backup_root / Path(name).name).resolve()
+        if (
+            target.parent != self.backup_root.resolve()
+            or not target.is_file()
+            or target.suffix != ".zip"
+        ):
+            return error_response("备份文件不存在")
+        return file_response(
+            target, filename=target.name, content_type="application/zip"
+        )
+
+    async def _web_restore(self):
+        files = await request.files()
+        upload = files.get("file")
+        if upload is None:
+            return error_response("请上传备份压缩包")
+        tmp_path = (
+            self.backup_root.parent
+            / f"restore_upload_{int(time.time() * 1000)}_{random.randint(1000, 9999)}.zip"
+        )
+        try:
+            await upload.save(tmp_path)
+            stats = self._restore_from_zip(tmp_path)
+        except Exception as exc:
+            logger.error("恢复备份失败: %s", exc, exc_info=True)
+            return error_response(f"恢复失败：{exc}")
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+        return json_response({"status": "success", "data": stats})
+
+    def _backup_to_zip(self) -> dict:
+        """把当前全部表情包数据打包为 zip（含 manifest 校验清单）。"""
+        self.backup_root.mkdir(parents=True, exist_ok=True)
+        filename = (
+            f"sticker_backup_{time.strftime('%Y%m%d_%H%M%S')}_{random.randint(1000, 9999)}.zip"
+        )
+        target = self.backup_root / filename
+        files_meta = []
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(
+                "index.json",
+                json.dumps(self.index, ensure_ascii=False, indent=2),
+            )
+            zf.writestr(
+                "blocked_keywords.json",
+                json.dumps(sorted(self.blocked_keywords), ensure_ascii=False, indent=2),
+            )
+            for keyword, names in self.index.items():
+                folder = self.data_dir / keyword
+                for fname in names:
+                    fpath = folder / fname
+                    if not fpath.is_file():
+                        continue
+                    arc = f"{keyword}/{fname}"
+                    zf.write(fpath, arc)
+                    files_meta.append({"path": arc, "md5": self._md5(fpath)})
+            zf.writestr(
+                "manifest.json",
+                json.dumps(
+                    {
+                        "version": 1,
+                        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "keywords": len(self.index),
+                        "images": len(files_meta),
+                        "files": files_meta,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+        return {
+            "filename": filename,
+            "size": target.stat().st_size,
+            "keywords": len(self.index),
+            "images": len(files_meta),
+        }
+
+    def _restore_from_zip(self, zip_path: Path) -> dict:
+        """校验备份压缩包并合并恢复；重叠图片按 MD5 跳过。"""
+        try:
+            zip_file = zipfile.ZipFile(zip_path)
+        except zipfile.BadZipFile as exc:
+            raise ValueError(f"压缩包已损坏或不是有效的 zip 文件：{exc}") from exc
+        with zip_file as zf:
+            bad = zf.testzip()
+            if bad is not None:
+                raise ValueError(f"压缩包已损坏：{bad}")
+            members = set(zf.namelist())
+            if "index.json" not in members or "manifest.json" not in members:
+                raise ValueError("压缩包格式不正确：缺少 index.json 或 manifest.json")
+            manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            if manifest.get("version") != 1:
+                raise ValueError("不支持的备份版本")
+            archive_index = json.loads(zf.read("index.json").decode("utf-8"))
+            if not isinstance(archive_index, dict):
+                raise ValueError("index.json 格式不正确")
+
+            expected: set = set()
+            archive_images = 0
+            for keyword, names in archive_index.items():
+                if not isinstance(names, list) or not names:
+                    raise ValueError(f"index.json 关键词 {keyword} 格式不正确")
+                if not self._is_valid_keyword(keyword):
+                    raise ValueError(f"index.json 包含非法关键词：{keyword}")
+                for fname in names:
+                    if not isinstance(fname, str) or not fname:
+                        raise ValueError(f"index.json 关键词 {keyword} 包含非法文件名")
+                    arc = f"{keyword}/{fname}"
+                    if arc not in members:
+                        raise ValueError(f"压缩包缺少文件：{arc}")
+                    expected.add(arc)
+                    archive_images += 1
+            if archive_images != manifest.get("images"):
+                raise ValueError(
+                    f"数据校验失败：manifest 记录 {manifest.get('images')} 张图片，"
+                    f"实际索引 {archive_images} 张"
+                )
+            if len(archive_index) != manifest.get("keywords"):
+                raise ValueError(
+                    f"数据校验失败：manifest 记录 {manifest.get('keywords')} 个关键词，"
+                    f"实际索引 {len(archive_index)} 个"
+                )
+            # 包内文件必须是索引引用的图片或固定元数据文件，且路径安全
+            for member in members:
+                if member in ("index.json", "manifest.json", "blocked_keywords.json"):
+                    continue
+                parts = Path(member).parts
+                if len(parts) != 2 or ".." in parts or parts[0] in (".", ".."):
+                    raise ValueError(f"压缩包包含非法路径：{member}")
+                if member not in expected:
+                    raise ValueError(f"压缩包包含未索引的文件：{member}")
+
+            blocked_archived: list = []
+            if "blocked_keywords.json" in members:
+                raw = json.loads(zf.read("blocked_keywords.json").decode("utf-8"))
+                if isinstance(raw, list):
+                    blocked_archived = [str(x) for x in raw]
+
+            added = skipped = overwritten = failed = 0
+            for keyword, names in archive_index.items():
+                folder = self.data_dir / keyword
+                folder.mkdir(parents=True, exist_ok=True)
+                for fname in names:
+                    arc = f"{keyword}/{fname}"
+                    tmp = folder / (
+                        f".restore_tmp_{int(time.time() * 1000)}_"
+                        f"{random.randint(1000, 9999)}"
+                    )
+                    try:
+                        tmp.write_bytes(zf.read(arc))
+                        md5 = self._md5(tmp)
+                        target = folder / fname
+                        if target.is_file():
+                            if self._md5(target) == md5:
+                                skipped += 1
+                                tmp.unlink(missing_ok=True)
+                                continue
+                            shutil.move(str(tmp), str(target))
+                            overwritten += 1
+                        else:
+                            shutil.move(str(tmp), str(target))
+                            added += 1
+                        if fname not in self.index.setdefault(keyword, []):
+                            self.index[keyword].append(fname)
+                    except Exception as exc:
+                        failed += 1
+                        logger.error("恢复图片失败 %s: %s", arc, exc)
+                        try:
+                            tmp.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+
+            old_blocked = set(self.blocked_keywords)
+            self.blocked_keywords.update(blocked_archived)
+            if self.blocked_keywords != old_blocked:
+                self._save_blocked()
+            self._save_index()
+
+        return {
+            "archive_keywords": len(archive_index),
+            "archive_images": archive_images,
+            "added": added,
+            "skipped": skipped,
+            "overwritten": overwritten,
+            "failed": failed,
+            "blocked_merged": len(blocked_archived),
+            "message": (
+                f"恢复完成：归档 {len(archive_index)} 个关键词 / {archive_images} 张图片；"
+                f"新增 {added} 张，覆盖 {overwritten} 张，跳过重复 {skipped} 张，"
+                f"失败 {failed} 张"
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # H. 屏蔽关键词（仅管理员）
+    # ------------------------------------------------------------------
+    async def _handle_block(self, event: AstrMessageEvent, message_str: str):
+        if not self._is_admin(event):
+            yield event.plain_result("此指令仅限管理员")
+            return
+
+        keyword = message_str[2:].strip()
+        if not keyword:
+            yield event.plain_result("用法：屏蔽{关键词}")
+            return
+        if not self._is_valid_keyword(keyword):
+            yield event.plain_result("关键词不合法")
+            return
+        if keyword in self.blocked_keywords:
+            yield event.plain_result(f"关键词 {keyword} 已在屏蔽列表中")
+            return
+
+        self.blocked_keywords.add(keyword)
+        self._save_blocked()
+        yield event.plain_result(f"已屏蔽关键词：{keyword}")
+
+    async def _handle_unblock(self, event: AstrMessageEvent, message_str: str):
+        if not self._is_admin(event):
+            yield event.plain_result("此指令仅限管理员")
+            return
+
+        keyword = message_str[4:].strip()
+        if not keyword:
+            yield event.plain_result("用法：解除屏蔽{关键词}")
+            return
+        if keyword not in self.blocked_keywords:
+            yield event.plain_result(f"关键词 {keyword} 不在屏蔽列表中")
+            return
+
+        self.blocked_keywords.discard(keyword)
+        self._save_blocked()
+        yield event.plain_result(f"已解除屏蔽：{keyword}")
+
+    async def _handle_block_list(self, event: AstrMessageEvent, message_str: str):
+        if not self._is_admin(event):
+            yield event.plain_result("此指令仅限管理员")
+            return
+
+        if not self.blocked_keywords:
+            yield event.plain_result("暂无屏蔽关键词")
+            return
+        yield event.plain_result(
+            "屏蔽关键词列表：\n" + "\n".join(sorted(self.blocked_keywords))
+        )
 
     # ------------------------------------------------------------------
     # 工具方法
@@ -533,6 +977,26 @@ class StickerPlugin(Star):
         else:
             self.index = {}
             self._save_index()
+
+    def _load_blocked(self):
+        self.blocked_keywords = set()
+        if self.blocked_path.exists():
+            try:
+                raw = json.loads(self.blocked_path.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    self.blocked_keywords = {str(x) for x in raw if isinstance(x, str)}
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.error("读取屏蔽列表失败: %s", exc)
+
+    def _save_blocked(self):
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            self.blocked_path.write_text(
+                json.dumps(sorted(self.blocked_keywords), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.error("保存屏蔽列表失败: %s", exc)
 
     def _save_index(self):
         try:
