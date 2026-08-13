@@ -6,8 +6,8 @@ desc: |
   分页列表、精准删除与二次确认批量删除、存储统计与超容量警告。
   数据保存在 data/stickers/ 目录下。
 version: 1.0.0
-author: your_name
-repo: ""
+author: td1336065617
+repo: https://github.com/td1336065617/laizhiqingchu-bot
 astrbot_version: ">=4.13.0"
 support_platforms:
   - qq_official
