@@ -1,0 +1,13 @@
+name: sticker_plugin
+display_name: 表情包管理
+short_desc: QQ 群表情包管理：添加、随机发送、列表、删除、统计
+desc: |
+  通过“回复包含图片的消息”添加表情包，支持关键词管理、随机发送、
+  分页列表、精准删除与二次确认批量删除、存储统计与超容量警告。
+  数据保存在 data/stickers/ 目录下。
+version: 1.0.0
+author: your_name
+repo: ""
+astrbot_version: ">=4.13.0"
+support_platforms:
+  - qq_official
