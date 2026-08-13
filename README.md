@@ -81,3 +81,12 @@ data/sticker_backups/        # WebUI 备份产生的压缩包
 
 将本目录（`metadata.yaml`、`main.py`、`pages/`）放入
 `AstrBot/data/plugins/sticker_plugin/`，然后在 WebUI 插件管理页启用并重载插件。
+
+## 更新
+
+1. 拉取最新代码（`git pull`），查看 [CHANGELOG.md](CHANGELOG.md) 了解本次改动；
+2. 把 `main.py`、`metadata.yaml`、`pages/` 同步到服务器/本机的
+   `AstrBot/data/plugins/sticker_plugin/`；
+3. 在 AstrBot WebUI 插件管理页重载插件（或重启 AstrBot）。
+
+`data/stickers/` 与 `data/config/` 下的数据不会被覆盖，更新不会丢失表情包。
