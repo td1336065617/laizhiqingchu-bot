@@ -179,7 +179,18 @@
         delBtn.className = 'danger';
         delBtn.textContent = '删除';
         delBtn.onclick = async () => {
-          if (!confirm('确定删除备份文件 ' + item.filename + ' 吗？\n仅删除压缩包，不影响现有表情包数据。')) return;
+          // 插件页面 iframe 沙箱不支持 confirm()，沿用“清空”的二次点击确认
+          if (delBtn.dataset.armed !== '1') {
+            delBtn.dataset.armed = '1';
+            delBtn.textContent = '再次点击确认删除';
+            setTimeout(() => {
+              delBtn.dataset.armed = '';
+              delBtn.textContent = '删除';
+            }, 5000);
+            return;
+          }
+          delBtn.dataset.armed = '';
+          delBtn.textContent = '删除';
           try {
             const r = await A.apiPost('backup/delete', { name: item.filename });
             show((r && r.message) || '已删除备份文件');
