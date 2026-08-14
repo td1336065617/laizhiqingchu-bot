@@ -166,6 +166,12 @@ class StickerPlugin(Star):
                 "下载表情包备份压缩包",
             )
             self.context.register_web_api(
+                f"/{PLUGIN_NAME}/backup/delete",
+                self._web_backup_delete,
+                ["POST"],
+                "删除表情包备份压缩包",
+            )
+            self.context.register_web_api(
                 f"/{PLUGIN_NAME}/restore",
                 self._web_restore,
                 ["POST"],
@@ -859,6 +865,38 @@ class StickerPlugin(Star):
             return error_response("备份文件不存在")
         return file_response(
             target, filename=target.name, content_type="application/zip"
+        )
+
+    async def _web_backup_delete(self):
+        """删除备份列表中的指定压缩包（仅删除备份文件，不影响现有表情包数据）。"""
+        payload = await request.json(default=None)
+        if not isinstance(payload, dict):
+            return error_response("请求体格式不正确")
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            return error_response("缺少备份文件名")
+        # 与下载一致：只允许 sticker_backups 目录内、名为原文件名的 zip
+        target = (self.backup_root / Path(name).name).resolve()
+        if (
+            target.parent != self.backup_root.resolve()
+            or not target.is_file()
+            or target.suffix != ".zip"
+        ):
+            return error_response("备份文件不存在")
+        try:
+            target.unlink()
+        except OSError as exc:
+            logger.error("删除备份文件失败: %s", exc)
+            return error_response(f"删除失败：{exc}")
+        logger.info("StickerPlugin 已删除备份文件: %s", target.name)
+        return json_response(
+            {
+                "status": "success",
+                "data": {
+                    "filename": target.name,
+                    "message": f"已删除备份文件 {target.name}",
+                },
+            }
         )
 
     async def _web_restore(self):
