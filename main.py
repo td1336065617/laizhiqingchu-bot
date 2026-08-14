@@ -1,7 +1,7 @@
 """AstrBot QQ 群表情包管理插件（StickerPlugin）。
 
 指令（精确前缀触发，不匹配的消息完全忽略）：
-- 添加{关键词}        回复含图片/合并转发的消息后触发，支持批量入库
+- 批量添加合并转发{关键词}  先发送命令，90 秒内本人发送的合并转发自动批量入库
 - 来只{关键词}        随机发送一张该关键词下的图片
 - 列表{关键词}{页码}   仅管理员，分页查看（每页 10 张）
 - 删图                仅管理员，回复图片按 MD5 自动定位删除；或 删图{关键词}{序号} 按序号删除
@@ -41,6 +41,7 @@ PLUGIN_NAME = "sticker_plugin"
 # 与指令名重名的关键词一律不合法
 RESERVED_KEYWORDS = {
     "添加",
+    "批量添加合并转发",
     "来只",
     "列表",
     "删图",
@@ -53,8 +54,8 @@ RESERVED_KEYWORDS = {
 }
 # 二次删除确认的有效期（秒）
 CONFIRM_TTL = 60
-# 合并转发（聊天记录）缓存有效期（秒）：收到后供“添加”指令批量导入
-FORWARD_TTL = 600
+# “先发添加指令、再发合并转发”模式的等待有效期（秒）
+FORWARD_ADD_TTL = 90
 # QQ 官方机器人“聊天记录（合并转发）”消息类型
 QQ_FORWARD_MESSAGE_TYPE = 102
 # 列表分页大小
@@ -130,8 +131,8 @@ class StickerPlugin(Star):
         self.pending_delete: dict = {}
         # 屏蔽关键词集合
         self.blocked_keywords: set = set()
-        # 最近收到的合并转发图片缓存：{key: {"time": float, "images": [Image]}}
-        self.pending_forwards: dict = {}
+        # 等待合并转发的添加状态：{key: {"keyword": str, "time": float}}
+        self.pending_forward_add: dict = {}
         self._load_index()
         self._load_blocked()
         self._check_storage()
@@ -229,13 +230,19 @@ class StickerPlugin(Star):
                 getattr(raw, "message_reference", None),
                 getattr(raw, "msg_elements", None),
             )
-        # 合并转发（message_type=102）到达时先缓存其中的图片，供后续“添加”批量导入
-        self._cache_forward(event)
+        # 合并转发（message_type=102）到达时，若该群处于“等待合并转发”状态则批量添加
+        if self._is_forward_event(event):
+            async for result in self._process_forward_add(event):
+                yield result
+            return
         if not message_str:
             return
 
         try:
-            if message_str.startswith("添加"):
+            if message_str.startswith("批量添加合并转发"):
+                async for result in self._handle_batch_add_forward(event, message_str):
+                    yield result
+            elif message_str.startswith("添加"):
                 async for result in self._handle_add(event, message_str):
                     yield result
             elif message_str.startswith("来只"):
@@ -308,19 +315,46 @@ class StickerPlugin(Star):
                     len(images),
                 )
         if not images:
-            images = self._take_recent_forward(event)
-            if images:
-                logger.info(
-                    "StickerPlugin 添加: 使用最近收到的合并转发中的 %s 张图片",
-                    len(images),
-                )
-        if not images:
             yield event.plain_result(
-                "添加失败：未获取到图片。请回复包含图片/合并转发的消息，"
-                "或把图片和“添加{关键词}”放在同一条消息发送"
+                "添加失败：未获取到图片。请回复包含图片的消息，"
+                "或使用“批量添加合并转发{关键词}”后发送合并转发批量入库"
             )
             return
 
+        added, skipped, failed = await self._add_images(keyword, images)
+        if failed:
+            yield event.plain_result(
+                f"成功添加 {added} 张图片（跳过 {skipped} 张重复，{failed} 张下载失败）"
+            )
+        else:
+            yield event.plain_result(f"成功添加 {added} 张图片（跳过 {skipped} 张重复）")
+
+    async def _handle_batch_add_forward(
+        self, event: AstrMessageEvent, message_str: str
+    ):
+        """批量添加合并转发：先发送命令，90 秒内本人发送的合并转发自动入库。"""
+        keyword = message_str[len("批量添加合并转发") :].strip()
+        if not keyword:
+            yield event.plain_result("用法：批量添加合并转发{关键词}")
+            return
+        if not self._is_valid_keyword(keyword):
+            yield event.plain_result("关键词不合法")
+            return
+        if keyword in self.blocked_keywords:
+            yield event.plain_result(f"关键词 {keyword} 已被屏蔽，无法添加")
+            return
+
+        key = self._forward_key(event)
+        self.pending_forward_add[key] = {"keyword": keyword, "time": time.time()}
+        yield event.plain_result(
+            f"已准备批量添加关键词 {keyword}：请在 {FORWARD_ADD_TTL} 秒内"
+            "发送合并转发，将自动提取其中的图片入库"
+        )
+
+    async def _add_images(
+        self, keyword: str, images: List[Image]
+    ) -> Tuple[int, int, int]:
+        """把图片批量写入关键词目录（MD5 去重），返回 (新增, 跳过重复, 下载失败)。"""
         folder = self.data_dir / keyword
         folder.mkdir(parents=True, exist_ok=True)
         existing_md5 = set()
@@ -374,12 +408,7 @@ class StickerPlugin(Star):
             added += 1
 
         self._save_index()
-        if failed:
-            yield event.plain_result(
-                f"成功添加 {added} 张图片（跳过 {skipped} 张重复，{failed} 张下载失败）"
-            )
-        else:
-            yield event.plain_result(f"成功添加 {added} 张图片（跳过 {skipped} 张重复）")
+        return added, skipped, failed
 
     # ------------------------------------------------------------------
     # B. 发送（来只{关键词}）
@@ -683,7 +712,8 @@ class StickerPlugin(Star):
         lines = [
             "表情包管理菜单",
             "【所有人可用】",
-            "添加{关键词} - 回复图片/合并转发消息，或与图片同一条消息发送，即可批量入库",
+            "添加{关键词} - 回复图片批量入库",
+            "批量添加合并转发{关键词} - 先发送命令，90秒内本人发送的合并转发自动批量入库",
             "来只{关键词} - 随机发送一张该关键词的图片",
             "菜单 - 显示本菜单",
             "【仅管理员】",
@@ -1117,45 +1147,60 @@ class StickerPlugin(Star):
 
     def _forward_key(self, event: AstrMessageEvent) -> str:
         group = event.get_group_id()
+        sender = event.get_sender_id() or "unknown"
         if group:
-            return f"group:{group}"
-        return f"user:{event.get_sender_id() or 'unknown'}"
+            return f"group:{group}:{sender}"
+        return f"user:{sender}"
 
-    def _cache_forward(self, event: AstrMessageEvent) -> None:
-        """收到合并转发（message_type=102）时缓存其中的图片，供“添加”批量导入。"""
+    @staticmethod
+    def _is_forward_event(event: AstrMessageEvent) -> bool:
+        """判断是否为合并转发（聊天记录，message_type=102）消息。"""
         raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
         if raw is None:
-            return
+            return False
         try:
-            message_type = int(getattr(raw, "message_type", None) or 0)
+            return (
+                int(getattr(raw, "message_type", None) or 0)
+                == QQ_FORWARD_MESSAGE_TYPE
+            )
         except (TypeError, ValueError):
+            return False
+
+    async def _process_forward_add(self, event: AstrMessageEvent):
+        """处于“等待合并转发”状态时，解析本次转发并批量添加。"""
+        key = self._forward_key(event)
+        state = self.pending_forward_add.get(key)
+        if not state:
             return
-        if message_type != QQ_FORWARD_MESSAGE_TYPE:
+        self.pending_forward_add.pop(key, None)
+        if time.time() - state["time"] > FORWARD_ADD_TTL:
+            yield event.plain_result(
+                "等待超时，请重新发送 批量添加合并转发{关键词} 后再发合并转发"
+            )
             return
-        elements = getattr(raw, "msg_elements", None)
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        elements = getattr(raw, "msg_elements", None) if raw else None
         if not isinstance(elements, list) or not elements:
+            yield event.plain_result("未从合并转发中解析到内容，请重试")
             return
         images = self._collect_forward_images(elements)
         if not images:
+            yield event.plain_result("该合并转发中没有解析到图片")
             return
-        key = self._forward_key(event)
-        self.pending_forwards[key] = {"time": time.time(), "images": images}
-        logger.info(
-            "StickerPlugin 缓存合并转发图片: %s 张 (key=%s)", len(images), key
-        )
-
-    def _take_recent_forward(self, event: AstrMessageEvent) -> Optional[List[Image]]:
-        """取同群/同用户最近收到的合并转发图片（超时返回 None 并清理）。"""
-        key = self._forward_key(event)
-        cache = self.pending_forwards.get(key)
-        if not cache:
-            return None
-        if time.time() - cache["time"] > FORWARD_TTL:
-            self.pending_forwards.pop(key, None)
-            return None
-        images = cache.get("images") or []
-        self.pending_forwards.pop(key, None)
-        return images or None
+        keyword = state["keyword"]
+        if keyword in self.blocked_keywords:
+            yield event.plain_result(f"关键词 {keyword} 已被屏蔽，无法添加")
+            return
+        added, skipped, failed = await self._add_images(keyword, images)
+        if failed:
+            yield event.plain_result(
+                f"已从合并转发添加 {added} 张图片"
+                f"（跳过 {skipped} 张重复，{failed} 张下载失败）"
+            )
+        else:
+            yield event.plain_result(
+                f"已从合并转发添加 {added} 张图片（跳过 {skipped} 张重复）"
+            )
 
     def _extract_quoted_forward_images(
         self, event: AstrMessageEvent
