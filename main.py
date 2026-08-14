@@ -1,7 +1,7 @@
 """AstrBot QQ 群表情包管理插件（StickerPlugin）。
 
 指令（精确前缀触发，不匹配的消息完全忽略）：
-- 添加{关键词}        回复一条含图片的消息后触发，支持多图批量入库
+- 添加{关键词}        回复含图片/合并转发的消息后触发，支持批量入库
 - 来只{关键词}        随机发送一张该关键词下的图片
 - 列表{关键词}{页码}   仅管理员，分页查看（每页 10 张）
 - 删图                仅管理员，回复图片按 MD5 自动定位删除；或 删图{关键词}{序号} 按序号删除
@@ -53,6 +53,10 @@ RESERVED_KEYWORDS = {
 }
 # 二次删除确认的有效期（秒）
 CONFIRM_TTL = 60
+# 合并转发（聊天记录）缓存有效期（秒）：收到后供“添加”指令批量导入
+FORWARD_TTL = 600
+# QQ 官方机器人“聊天记录（合并转发）”消息类型
+QQ_FORWARD_MESSAGE_TYPE = 102
 # 列表分页大小
 PAGE_SIZE = 10
 # 默认存储上限（MB），可通过 _conf_schema.json 的 max_storage_mb 覆盖
@@ -126,6 +130,8 @@ class StickerPlugin(Star):
         self.pending_delete: dict = {}
         # 屏蔽关键词集合
         self.blocked_keywords: set = set()
+        # 最近收到的合并转发图片缓存：{key: {"time": float, "images": [Image]}}
+        self.pending_forwards: dict = {}
         self._load_index()
         self._load_blocked()
         self._check_storage()
@@ -223,6 +229,8 @@ class StickerPlugin(Star):
                 getattr(raw, "message_reference", None),
                 getattr(raw, "msg_elements", None),
             )
+        # 合并转发（message_type=102）到达时先缓存其中的图片，供后续“添加”批量导入
+        self._cache_forward(event)
         if not message_str:
             return
 
@@ -293,9 +301,23 @@ class StickerPlugin(Star):
                     len(images),
                 )
         if not images:
+            images = self._extract_quoted_forward_images(event)
+            if images:
+                logger.info(
+                    "StickerPlugin 添加: 从引用消息中解析出 %s 张合并转发图片",
+                    len(images),
+                )
+        if not images:
+            images = self._take_recent_forward(event)
+            if images:
+                logger.info(
+                    "StickerPlugin 添加: 使用最近收到的合并转发中的 %s 张图片",
+                    len(images),
+                )
+        if not images:
             yield event.plain_result(
-                "添加失败：未获取到图片。请把图片和“添加{关键词}”放在同一条消息发送"
-                "（私聊引用消息平台可能不下发被引用内容）"
+                "添加失败：未获取到图片。请回复包含图片/合并转发的消息，"
+                "或把图片和“添加{关键词}”放在同一条消息发送"
             )
             return
 
@@ -661,7 +683,7 @@ class StickerPlugin(Star):
         lines = [
             "表情包管理菜单",
             "【所有人可用】",
-            "添加{关键词} - 回复图片，或与图片同一条消息发送，即可入库",
+            "添加{关键词} - 回复图片/合并转发消息，或与图片同一条消息发送，即可批量入库",
             "来只{关键词} - 随机发送一张该关键词的图片",
             "菜单 - 显示本菜单",
             "【仅管理员】",
@@ -1092,6 +1114,107 @@ class StickerPlugin(Star):
                 images = [c for c in reply_chain if isinstance(c, Image)]
                 return images
         return None
+
+    def _forward_key(self, event: AstrMessageEvent) -> str:
+        group = event.get_group_id()
+        if group:
+            return f"group:{group}"
+        return f"user:{event.get_sender_id() or 'unknown'}"
+
+    def _cache_forward(self, event: AstrMessageEvent) -> None:
+        """收到合并转发（message_type=102）时缓存其中的图片，供“添加”批量导入。"""
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if raw is None:
+            return
+        try:
+            message_type = int(getattr(raw, "message_type", None) or 0)
+        except (TypeError, ValueError):
+            return
+        if message_type != QQ_FORWARD_MESSAGE_TYPE:
+            return
+        elements = getattr(raw, "msg_elements", None)
+        if not isinstance(elements, list) or not elements:
+            return
+        images = self._collect_forward_images(elements)
+        if not images:
+            return
+        key = self._forward_key(event)
+        self.pending_forwards[key] = {"time": time.time(), "images": images}
+        logger.info(
+            "StickerPlugin 缓存合并转发图片: %s 张 (key=%s)", len(images), key
+        )
+
+    def _take_recent_forward(self, event: AstrMessageEvent) -> Optional[List[Image]]:
+        """取同群/同用户最近收到的合并转发图片（超时返回 None 并清理）。"""
+        key = self._forward_key(event)
+        cache = self.pending_forwards.get(key)
+        if not cache:
+            return None
+        if time.time() - cache["time"] > FORWARD_TTL:
+            self.pending_forwards.pop(key, None)
+            return None
+        images = cache.get("images") or []
+        self.pending_forwards.pop(key, None)
+        return images or None
+
+    def _extract_quoted_forward_images(
+        self, event: AstrMessageEvent
+    ) -> Optional[List[Image]]:
+        """尝试直接从引用消息的原始 msg_elements 中提取合并转发图片。"""
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if raw is None:
+            return None
+        elements = getattr(raw, "msg_elements", None)
+        if not isinstance(elements, list) or not elements:
+            return None
+        return self._collect_forward_images([elements[0]]) or None
+
+    @classmethod
+    def _collect_forward_images(cls, elements: list) -> List[Image]:
+        """递归提取合并转发 msg_elements 中的全部图片，返回去重后的 Image 列表。"""
+        urls: list = []
+        seen: set = set()
+
+        def get_attr(element, key):
+            if isinstance(element, dict):
+                return element.get(key)
+            return getattr(element, key, None)
+
+        def handle_element(element) -> None:
+            if element is None:
+                return
+            attachments = get_attr(element, "attachments") or []
+            nested = get_attr(element, "msg_elements") or get_attr(element, "elements") or []
+            content = get_attr(element, "content")
+            if isinstance(attachments, list):
+                for att in attachments:
+                    url = str(get_attr(att, "url") or "").strip()
+                    ctype = str(get_attr(att, "content_type") or "").lower()
+                    filename = str(
+                        get_attr(att, "filename") or get_attr(att, "name") or ""
+                    )
+                    ext = Path(filename).suffix.lower()
+                    if url and (ctype.startswith("image") or ext in ALLOWED_EXTS):
+                        if url not in seen:
+                            seen.add(url)
+                            urls.append(url)
+            if isinstance(content, str) and content.strip().startswith(("{", "[")):
+                try:
+                    parsed = json.loads(content)
+                except (json.JSONDecodeError, TypeError):
+                    parsed = None
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        handle_element(item)
+                elif isinstance(parsed, dict):
+                    handle_element(parsed)
+            if isinstance(nested, list):
+                for item in nested:
+                    handle_element(item)
+
+        for element in elements:
+            handle_element(element)
+        return [Image.fromURL(url) for url in urls]
 
     @staticmethod
     def _is_valid_keyword(keyword: str) -> bool:
