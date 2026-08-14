@@ -266,12 +266,22 @@ class StickerPlugin(Star):
     # A. 添加（回复消息中包含图片才触发，否则完全无视）
     # ------------------------------------------------------------------
     async def _handle_add(self, event: AstrMessageEvent, message_str: str):
+        keyword = message_str[2:].strip()
+        if not keyword:
+            yield event.plain_result("用法：添加{关键词}（请回复包含图片的消息）")
+            return
+        if not self._is_valid_keyword(keyword):
+            yield event.plain_result("关键词不合法")
+            return
+        if keyword in self.blocked_keywords:
+            yield event.plain_result(f"关键词 {keyword} 已被屏蔽，无法添加")
+            return
+
         images = self._extract_reply_images(event)
         logger.info(
             "StickerPlugin 添加: 提取到引用图片 %s",
             None if images is None else len(images),
         )
-        keyword = message_str[2:].strip()
         # 兜底：引用里没有图片（平台可能不下发引用内容）时，
         # 尝试使用当前消息自带的图片，例如“添加蓝色大肥鱼”+ 图片 同一条消息发送。
         if not images:
@@ -283,20 +293,10 @@ class StickerPlugin(Star):
                     len(images),
                 )
         if not images:
-            if keyword:
-                yield event.plain_result(
-                    "添加失败：未获取到图片。请把图片和“添加{关键词}”放在同一条消息发送"
-                    "（私聊引用消息平台可能不下发被引用内容）"
-                )
-            return
-        if not keyword:
-            yield event.plain_result("用法：添加{关键词}（请回复包含图片的消息）")
-            return
-        if not self._is_valid_keyword(keyword):
-            yield event.plain_result("关键词不合法")
-            return
-        if keyword in self.blocked_keywords:
-            yield event.plain_result(f"关键词 {keyword} 已被屏蔽，无法添加")
+            yield event.plain_result(
+                "添加失败：未获取到图片。请把图片和“添加{关键词}”放在同一条消息发送"
+                "（私聊引用消息平台可能不下发被引用内容）"
+            )
             return
 
         folder = self.data_dir / keyword
@@ -370,6 +370,9 @@ class StickerPlugin(Star):
         if not self._is_valid_keyword(keyword):
             yield event.plain_result("关键词不合法")
             return
+        if keyword in self.blocked_keywords:
+            yield event.plain_result(f"关键词 {keyword} 已被屏蔽，无法发送")
+            return
 
         # 自修复：索引中存在但文件已丢失的条目自动清理
         files = self._prune_missing(keyword)
@@ -395,6 +398,9 @@ class StickerPlugin(Star):
             return
         if not self._is_valid_keyword(keyword):
             yield event.plain_result("关键词不合法")
+            return
+        if keyword in self.blocked_keywords:
+            yield event.plain_result(f"关键词 {keyword} 已被屏蔽")
             return
 
         files = self._prune_missing(keyword)
@@ -659,7 +665,7 @@ class StickerPlugin(Star):
             "来只{关键词} - 随机发送一张该关键词的图片",
             "菜单 - 显示本菜单",
             "【仅管理员】",
-            "屏蔽{关键词} - 屏蔽关键词，禁止添加",
+            "屏蔽{关键词} - 屏蔽关键词（禁止添加、发送、查看）",
             "屏蔽列表 - 查看屏蔽关键词",
             "解除屏蔽{关键词} - 解除屏蔽",
             "列表{关键词}{页码} - 分页查看该关键词的图片（每页10张）",
