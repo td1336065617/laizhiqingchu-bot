@@ -7,7 +7,7 @@
 - 删图                仅管理员，回复图片按 MD5 自动定位删除；或 删图{关键词}{序号} 按序号删除
 - 删除{关键词}        仅管理员，二次确认（60 秒）后删除整个关键词目录
 - 统计              仅管理员，查看关键词数、图片总数、Top 3
-- 菜单              所有人，查看指令与权限说明
+- 表情包管理菜单      所有人，查看指令与权限说明
 - 屏蔽{关键词}       仅管理员，屏蔽关键词（禁止添加）
 - 屏蔽列表          仅管理员，查看屏蔽关键词列表
 - 解除屏蔽{关键词}    仅管理员，解除关键词屏蔽
@@ -47,7 +47,7 @@ RESERVED_KEYWORDS = {
     "删图",
     "删除",
     "统计",
-    "菜单",
+    "表情包管理菜单",
     "屏蔽",
     "屏蔽列表",
     "解除屏蔽",
@@ -272,7 +272,7 @@ class StickerPlugin(Star):
             elif message_str.startswith("统计"):
                 async for result in self._handle_stats(event, message_str):
                     yield result
-            elif message_str.startswith("菜单"):
+            elif message_str.startswith("表情包管理菜单"):
                 async for result in self._handle_menu(event, message_str):
                     yield result
             elif message_str.startswith("屏蔽列表"):
@@ -727,7 +727,7 @@ class StickerPlugin(Star):
             "添加{关键词} - 回复图片批量入库",
             "批量添加合并转发{关键词} - 先发送命令，90秒内本人发送的合并转发自动批量入库",
             "来只{关键词} - 随机发送一张该关键词的图片",
-            "菜单 - 显示本菜单",
+            "表情包管理菜单 - 显示本菜单",
             "【仅管理员】",
             "屏蔽{关键词} - 屏蔽关键词（禁止添加、发送、查看）",
             "屏蔽列表 - 查看屏蔽关键词",
