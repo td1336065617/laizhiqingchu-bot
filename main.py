@@ -739,6 +739,7 @@ class StickerPlugin(Star):
             "删除{关键词} - 删除该关键词全部图片（60秒内二次确认）",
             "统计 - 查看关键词数、图片总数、图片数Top 3",
             "备份/恢复/管理员设置 - 请在 AstrBot WebUI 插件页面的“表情包管理”页操作",
+            "开源：https://github.com/td1336065617/laizhiqingchu-bot",
         ]
         yield event.plain_result("\n".join(lines))
 
