@@ -208,6 +208,9 @@ class StickerPlugin(Star):
     )
     async def on_message(self, event: AstrMessageEvent):
         message_str = (event.message_str or "").strip()
+        # QQ 官方指令面板可能自动补上“/”；统一去掉一个前缀后再匹配。
+        if message_str.startswith("/"):
+            message_str = message_str[1:].lstrip()
         logger.info(
             "StickerPlugin 事件: platform=%s type=%s sender=%s group=%s self=%s msg=%r",
             event.get_platform_name(),
