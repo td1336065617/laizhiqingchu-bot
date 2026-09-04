@@ -19,6 +19,7 @@ WebUI 后台：在 AstrBot 插件页面的“表情包管理”页中统一管�
 - data/stickers/{关键词}/{文件名}     图片文件
 """
 
+import asyncio
 import hashlib
 import json
 import random
@@ -34,6 +35,8 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Reply
 from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, file_response, json_response, request
+
+from .menu_renderer import StickerMenuRenderer
 
 # 与 metadata.yaml 的 name 保持一致；注册的 Web API 路由必须带插件名前缀
 PLUGIN_NAME = "sticker_plugin"
@@ -70,6 +73,32 @@ PAGE_SIZE = 10
 DEFAULT_MAX_STORAGE_MB = 200
 # 允许保留的图片扩展名（convert_to_file_path 可能返回无后缀的临时文件）
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+MENU_TEXT = "\n".join(
+    (
+        "🎴 表情包管理菜单",
+        "━━━━━━━━━━━━",
+        "👥 所有人可用",
+        "• 添加{关键词} ─ 回复图片批量入库",
+        "• 批量添加合并转发{关键词} ─ 先发命令，90秒内本人发合并转发自动批量入库",
+        "• 来只{关键词} ─ 随机发送一张该关键词的图片",
+        "• 表情包管理菜单 ─ 显示本菜单",
+        "━━━━━━━━━━━━",
+        "🔑 仅管理员",
+        "• 屏蔽{关键词} ─ 屏蔽关键词（禁止添加/发送/查看）",
+        "• 屏蔽列表 ─ 查看屏蔽关键词",
+        "• 解除屏蔽{关键词} ─ 解除屏蔽",
+        "• 列表{关键词}{页码} ─ 分页查看（每页10张）",
+        "• 删图 ─ 回复图片，按 MD5 自动定位并删除",
+        "• 删图{关键词} ─ 仅在该关键词下按 MD5 删除",
+        "• 删图{关键词}{序号} ─ 按序号删除单张",
+        "• 删除{关键词} ─ 二次确认后删除整个关键词",
+        "• 统计 ─ 关键词数 / 图片总数 / Top3",
+        "━━━━━━━━━━━━",
+        "⚙️ 备份/恢复/管理员设置：WebUI 表情包管理页",
+        "🔗 开源：https://github.com/td1336065617/laizhiqingchu-bot",
+    )
+)
 
 
 def _resolve_data_dir() -> Path:
@@ -131,6 +160,9 @@ class StickerPlugin(Star):
         self.index_path = self.data_dir / "index.json"
         self.backup_root = self.data_dir.parent / "sticker_backups"
         self.blocked_path = self.data_dir / "blocked_keywords.json"
+        self.menu_renderer = StickerMenuRenderer(
+            cache_dir=self.data_dir.parent / "sticker_menu_cache"
+        )
         # 索引结构：{"关键词": ["文件名1.png", ...]}
         self.index: dict = {}
         # 批量删除二次确认：{user_id: {"keyword": str, "time": float}}
@@ -724,31 +756,19 @@ class StickerPlugin(Star):
     # 菜单（所有人）
     # ------------------------------------------------------------------
     async def _handle_menu(self, event: AstrMessageEvent, message_str: str):
-        lines = [
-            "🌸 ELYSIAN PINK PEARL · 表情包菜单",
-            "╭──────────────╮",
-            "👥 所有人可用",
-            "• 添加{关键词} ─ 回复图片批量入库",
-            "• 批量添加合并转发{关键词} ─ 先发命令，90秒内本人发合并转发自动批量入库",
-            "• 来只{关键词} ─ 随机发送一张该关键词的图片",
-            "• 表情包管理菜单 ─ 显示本菜单",
-            "╰──────────────╯",
-            "🌙 仅管理员",
-            "• 屏蔽{关键词} ─ 屏蔽关键词（禁止添加/发送/查看）",
-            "• 屏蔽列表 ─ 查看屏蔽关键词",
-            "• 解除屏蔽{关键词} ─ 解除屏蔽",
-            "• 列表{关键词}{页码} ─ 分页查看（每页10张）",
-            "• 删图 ─ 回复图片，按 MD5 自动定位并删除",
-            "• 删图{关键词} ─ 仅在该关键词下按 MD5 删除",
-            "• 删图{关键词}{序号} ─ 按序号删除单张",
-            "• 删除{关键词} ─ 二次确认后删除整个关键词",
-            "• 统计 ─ 关键词数 / 图片总数 / Top3",
-            "╭──────────────╮",
-            "⚙️ 备份/恢复/管理员设置：WebUI 表情包管理页",
-            "🔗 开源：https://github.com/td1336065617/laizhiqingchu-bot",
-            "╰──────────────╯",
-        ]
-        yield event.plain_result("\n".join(lines))
+        try:
+            image_path = await asyncio.to_thread(
+                self.menu_renderer.render,
+                MENU_TEXT,
+            )
+        except Exception as exc:
+            logger.error("表情包管理菜单转图片失败：%s", exc, exc_info=True)
+            image_path = None
+        if image_path is not None and image_path.is_file():
+            yield event.image_result(str(image_path))
+            return
+        for piece in self.menu_renderer.text_chunks(MENU_TEXT):
+            yield event.plain_result(piece)
 
     # ------------------------------------------------------------------
     # G. WebUI 备份 / 恢复（AstrBot 管理面板后台）
