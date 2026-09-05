@@ -15,8 +15,17 @@ from typing import List, Optional, Tuple
 RENDER_WIDTH = 1200
 MIN_RENDER_HEIGHT = 760
 MAX_RENDER_HEIGHT = 8000
-RENDER_FORMAT_VERSION = 2
+RENDER_FORMAT_VERSION = 3
 MAX_TEXT_CHUNK = 1500
+
+# HTML 渲染器和 Pillow 回退统一使用简体中文字体。Pillow 读取 TTC
+# 时必须显式指定 SC face（NotoSansCJK 的 index=2），否则默认会加载
+# 日文字库面，菜单中文会出现方框或字形错乱。
+MENU_FONT_FAMILY = (
+    '"Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC", '
+    '"WenQuanYi Zen Hei", "Microsoft YaHei", "Noto Color Emoji", '
+    "sans-serif"
+)
 
 _ITEM_RE = re.compile(r"^\s*[•●▪◦*-]\s*")
 _DIVIDER_RE = re.compile(r"^\s*[\-_=─—–━]{3,}\s*$")
@@ -69,7 +78,10 @@ class StickerMenuRenderer:
     html, body {{ margin:0; padding:0; background:#21162d; }}
     body {{
       color:#4c315b;
-      font-family:"Noto Sans CJK SC","Microsoft YaHei",Arial,sans-serif;
+      font-family:{MENU_FONT_FAMILY};
+      font-variant-east-asian:simplified;
+      text-rendering:optimizeLegibility;
+      -webkit-font-smoothing:antialiased;
     }}
     .page {{
       width:{RENDER_WIDTH}px;
@@ -225,38 +237,89 @@ class StickerMenuRenderer:
         return renderers
 
     @staticmethod
-    def _find_cjk_font() -> Optional[str]:
+    def _font_index_from_env(default: int = 0) -> int:
+        try:
+            return max(
+                0,
+                int(os.environ.get("STICKER_MENU_FONT_INDEX", default)),
+            )
+        except (TypeError, ValueError):
+            return max(0, default)
+
+    @staticmethod
+    def _find_cjk_font_spec(*, bold: bool = False) -> Tuple[Optional[str], int]:
+        """返回真正的简体中文字体路径及 TTC face index。"""
         configured = os.environ.get("STICKER_MENU_FONT")
-        candidates = [configured] if configured else []
-        candidates.extend(
-            [
-                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-                "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
-                "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-                "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-                "/usr/share/fonts/truetype/arphic/uming.ttc",
-                "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
-            ]
-        )
-        for candidate in candidates:
-            if candidate and Path(candidate).is_file():
-                return candidate
+        if configured and Path(configured).is_file():
+            default_index = (
+                2
+                if Path(configured).suffix.casefold() == ".ttc"
+                and "NotoSansCJK" in Path(configured).name
+                else 0
+            )
+            return configured, StickerMenuRenderer._font_index_from_env(
+                default_index
+            )
+
         fc_match = shutil.which("fc-match")
         if fc_match:
-            try:
-                result = subprocess.run(
-                    [fc_match, "-f", "%{file}", ":lang=zh"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    check=False,
-                )
-                path = result.stdout.strip()
-                if result.returncode == 0 and Path(path).is_file():
-                    return path
-            except (OSError, subprocess.SubprocessError):
-                pass
-        return None
+            style = "Bold" if bold else "Regular"
+            queries = (
+                f"Noto Sans CJK SC:style={style}",
+                "Noto Sans CJK SC",
+                ":lang=zh-cn",
+            )
+            for query in queries:
+                try:
+                    result = subprocess.run(
+                        [
+                            fc_match,
+                            "-f",
+                            "%{file}|%{index}",
+                            query,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    path_text, _, index_text = (
+                        result.stdout.strip().partition("|")
+                    )
+                    if result.returncode != 0 or not Path(path_text).is_file():
+                        continue
+                    try:
+                        index = int(index_text or "0")
+                    except ValueError:
+                        index = 0
+                    return path_text, max(0, index)
+                except (OSError, subprocess.SubprocessError):
+                    break
+
+        if bold:
+            candidates = [
+                ("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc", 2),
+                ("/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc", 2),
+                ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 2),
+                ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0),
+            ]
+        else:
+            candidates = [
+                ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 2),
+                ("/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc", 2),
+                ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0),
+                ("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", 0),
+            ]
+        for path, index in candidates:
+            if Path(path).is_file():
+                return path, index
+        return None, 0
+
+    @staticmethod
+    def _find_cjk_font() -> Optional[str]:
+        """兼容旧调用方，只返回字体路径。"""
+        path, _ = StickerMenuRenderer._find_cjk_font_spec()
+        return path
 
     @staticmethod
     def _run_external_renderer(
@@ -328,15 +391,26 @@ class StickerMenuRenderer:
         except ImportError:
             return False
 
-        font_path = cls._find_cjk_font()
-        if not font_path:
+        regular_spec = cls._find_cjk_font_spec()
+        bold_spec = cls._find_cjk_font_spec(bold=True)
+        if not regular_spec[0] or not bold_spec[0]:
             return False
         try:
-            eyebrow_font = ImageFont.truetype(font_path, 16)
-            title_font = ImageFont.truetype(font_path, 38)
-            body_font = ImageFont.truetype(font_path, 20)
-            divider_font = ImageFont.truetype(font_path, 18)
-            footer_font = ImageFont.truetype(font_path, 16)
+            eyebrow_font = ImageFont.truetype(
+                bold_spec[0], 16, index=bold_spec[1]
+            )
+            title_font = ImageFont.truetype(
+                bold_spec[0], 38, index=bold_spec[1]
+            )
+            body_font = ImageFont.truetype(
+                regular_spec[0], 20, index=regular_spec[1]
+            )
+            divider_font = ImageFont.truetype(
+                regular_spec[0], 18, index=regular_spec[1]
+            )
+            footer_font = ImageFont.truetype(
+                regular_spec[0], 16, index=regular_spec[1]
+            )
         except (OSError, ValueError):
             return False
 
