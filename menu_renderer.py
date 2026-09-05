@@ -15,7 +15,7 @@ from typing import List, Optional, Tuple
 RENDER_WIDTH = 1200
 MIN_RENDER_HEIGHT = 760
 MAX_RENDER_HEIGHT = 8000
-RENDER_FORMAT_VERSION = 3
+RENDER_FORMAT_VERSION = 4
 MAX_TEXT_CHUNK = 1500
 
 # HTML 渲染器和 Pillow 回退统一使用简体中文字体。Pillow 读取 TTC
@@ -26,6 +26,41 @@ MENU_FONT_FAMILY = (
     '"WenQuanYi Zen Hei", "Microsoft YaHei", "Noto Color Emoji", '
     "sans-serif"
 )
+
+
+def _text_units(value: str) -> List[str]:
+    """按近似字素切分，避免把 emoji 的变体选择符拆开。"""
+    units: List[str] = []
+    for char in str(value):
+        if units and (
+            unicodedata.combining(char)
+            or "\ufe00" <= char <= "\ufe0f"
+            or char == "\u200d"
+            or units[-1].endswith("\u200d")
+        ):
+            units[-1] += char
+        else:
+            units.append(char)
+    return units
+
+
+def _tracked_width(draw, value: str, font, tracking: float) -> float:
+    units = _text_units(value)
+    width = sum(
+        draw.textbbox((0, 0), unit, font=font)[2]
+        - draw.textbbox((0, 0), unit, font=font)[0]
+        for unit in units
+    )
+    return width + max(0, len(units) - 1) * tracking
+
+
+def _draw_tracked(draw, xy, value: str, font, fill, tracking: float) -> None:
+    cursor = float(xy[0])
+    y = xy[1]
+    for unit in _text_units(value):
+        draw.text((round(cursor), y), unit, font=font, fill=fill)
+        box = draw.textbbox((0, 0), unit, font=font)
+        cursor += box[2] - box[0] + tracking
 
 _ITEM_RE = re.compile(r"^\s*[•●▪◦*-]\s*")
 _DIVIDER_RE = re.compile(r"^\s*[\-_=─—–━]{3,}\s*$")
@@ -122,24 +157,26 @@ class StickerMenuRenderer:
       color:#ffd2e9;
       font-size:14px;
       font-weight:800;
-      letter-spacing:3px;
+      line-height:1.5;
+      letter-spacing:3.6px;
       text-shadow:0 0 16px rgba(255,170,216,.45);
     }}
     .title {{
       position:relative;
       z-index:1;
-      margin-top:7px;
+      margin-top:9px;
       color:#fff7fb;
       font-size:38px;
+      line-height:1.4;
       font-weight:900;
-      letter-spacing:1px;
+      letter-spacing:1.6px;
       text-shadow:0 3px 20px rgba(255,137,195,.45);
     }}
     .panel {{
       position:relative;
       z-index:1;
-      margin-top:28px;
-      padding:24px 30px 28px;
+      margin-top:34px;
+      padding:29px 32px 34px;
       background:linear-gradient(145deg,rgba(255,252,255,.98),rgba(255,230,244,.93));
       border:1px solid rgba(255,211,235,.92);
       border-radius:20px;
@@ -159,15 +196,16 @@ class StickerMenuRenderer:
       white-space:pre-wrap;
       overflow-wrap:anywhere;
       font-size:20px;
-      line-height:1.55;
-      padding:3px 0;
+      line-height:1.72;
+      letter-spacing:.35px;
+      padding:5px 0;
     }}
-    .item {{ color:#c44786; font-weight:800; }}
-    .section {{ color:#8d5f82; font-weight:900; margin-top:8px; }}
-    .divider {{ color:#bd83a7; font-size:18px; letter-spacing:1px; }}
-    .footer {{ color:#6c93a8; font-size:16px; }}
+    .item {{ color:#c44786; font-weight:800; letter-spacing:.45px; }}
+    .section {{ color:#8d5f82; font-weight:900; line-height:1.5; margin-top:16px; letter-spacing:.45px; }}
+    .divider {{ color:#bd83a7; font-size:18px; letter-spacing:1.5px; }}
+    .footer {{ color:#6c93a8; font-size:16px; line-height:1.7; letter-spacing:.3px; }}
     .normal {{ color:#705276; }}
-    .blank {{ height:8px; }}
+    .blank {{ height:14px; }}
   </style>
 </head>
 <body>
@@ -191,7 +229,7 @@ class StickerMenuRenderer:
             rows += max(1, (width + 52) // 53)
             if cls._line_kind(line, index) in {"section", "footer"}:
                 rows += 1
-        return max(MIN_RENDER_HEIGHT, min(MAX_RENDER_HEIGHT, 190 + rows * 36))
+        return max(MIN_RENDER_HEIGHT, min(MAX_RENDER_HEIGHT, 205 + rows * 45))
 
     @staticmethod
     def _find_renderers() -> List[Tuple[str, str]]:
@@ -421,15 +459,20 @@ class StickerMenuRenderer:
             box = measure_draw.textbbox((0, 0), "菜单管理Ag", font=font)
             return max(24, box[3] - box[1] + 9)
 
-        def wrap(value: str, font, max_width: int) -> List[str]:
+        def wrap(
+            value: str,
+            font,
+            max_width: int,
+            tracking: float,
+        ) -> List[str]:
             result: List[str] = []
             for paragraph in value.splitlines() or [""]:
                 current = ""
                 for char in paragraph:
                     candidate = current + char
-                    if current and measure_draw.textbbox(
-                        (0, 0), candidate, font=font
-                    )[2] > max_width:
+                    if current and _tracked_width(
+                        measure_draw, candidate, font, tracking
+                    ) > max_width:
                         result.append(current)
                         current = char
                     else:
@@ -455,12 +498,21 @@ class StickerMenuRenderer:
                 "divider": "#bd83a7",
                 "footer": "#6c93a8",
             }.get(kind, "#705276")
-            for wrapped in wrap(line, font, inner_width):
-                body_rows.append((kind, wrapped, font, color))
+            tracking = (
+                0.5
+                if kind in {"item", "section"}
+                else 0.3
+                if kind == "footer"
+                else 0.35
+            )
+            for wrapped in wrap(line, font, inner_width, tracking):
+                body_rows.append((kind, wrapped, font, color, tracking))
 
         eyebrow_height = line_height(eyebrow_font)
         title_height = line_height(title_font)
-        body_height = sum(line_height(font) + 4 for _, _, font, _ in body_rows)
+        body_height = sum(
+            line_height(font) + 7 for _, _, font, _, _ in body_rows
+        )
         image_height = max(
             MIN_RENDER_HEIGHT,
             min(
@@ -486,14 +538,23 @@ class StickerMenuRenderer:
             outline="#b6e7f0",
             width=2,
         )
-        draw.text(
+        _draw_tracked(
+            draw,
             (56, 46),
             "ELYSIAN // PINK PEARL MENU",
-            font=eyebrow_font,
-            fill="#ffd5e8",
+            eyebrow_font,
+            "#ffd5e8",
+            0.65,
         )
-        title_y = 46 + eyebrow_height + 7
-        draw.text((56, title_y), lines[0], font=title_font, fill="#fff7fb")
+        title_y = 46 + eyebrow_height + 9
+        _draw_tracked(
+            draw,
+            (56, title_y),
+            lines[0],
+            title_font,
+            "#fff7fb",
+            1.0,
+        )
         panel_top = title_y + title_height + 22
         panel_bottom = image_height - 34
         draw.rounded_rectangle(
@@ -508,17 +569,26 @@ class StickerMenuRenderer:
             fill="#e467a5",
             width=3,
         )
-        y = panel_top + 26
-        for kind, value, font, color in body_rows:
+        y = panel_top + 30
+        for kind, value, font, color, tracking in body_rows:
             if kind in {"section", "footer"}:
-                y += 6
-            draw.text((86, y), value, font=font, fill=color)
-            y += line_height(font) + 4
-        draw.text(
-            (56, image_height - 28),
+                y += 9
+            _draw_tracked(
+                draw,
+                (86, y),
+                value,
+                font,
+                color,
+                tracking,
+            )
+            y += line_height(font) + 7
+        _draw_tracked(
+            draw,
+            (56, image_height - 30),
             "原版菜单排版 · 仅展示指令与权限说明",
-            font=footer_font,
-            fill="#e3b9d2",
+            footer_font,
+            "#e3b9d2",
+            0.3,
         )
         try:
             image.save(image_path, format="PNG")
