@@ -25,7 +25,10 @@
 运行环境没有可用浏览器时使用 Pillow，所有渲染器不可用才回退为原版文字。
 菜单图片默认使用 `Noto Sans CJK SC` 的简体中文字体面；如需指定字体文件，
 可设置 `STICKER_MENU_FONT`，使用 TTC 字体时可通过 `STICKER_MENU_FONT_INDEX`
-指定字体面索引。
+指定字体面索引。Emoji 使用插件自带的
+`assets/fonts/NotoColorEmoji.ttf`，不依赖服务器安装字体；Pillow 会先高分辨率
+绘制再缩放，字体加载失败时使用安全符号兜底。可通过
+`STICKER_MENU_EMOJI_FONT` 和 `STICKER_MENU_EMOJI_FONT_INDEX` 覆盖字体路径与字体面。
 
 ## 配置
 
