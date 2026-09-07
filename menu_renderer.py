@@ -978,16 +978,27 @@ class StickerMenuRenderer:
 
     @staticmethod
     def text_chunks(text: str, max_chunk: int = MAX_TEXT_CHUNK):
-        """转图失败时按换行切分，尽量保持原版菜单排版。"""
+        """转图失败时按换行切分，尽量保持原版菜单排版。
+
+        只移除分片首尾换行，保留前导空格缩进；优先行尾/空格断片。
+        """
         value = str(text or "")
         start = 0
-        while start < len(value):
-            end = min(start + max_chunk, len(value))
-            if end < len(value):
+        total = len(value)
+        limit = max(1, int(max_chunk))
+        while start < total:
+            end = min(start + limit, total)
+            if end < total:
                 newline = value.rfind("\n", start, end)
-                if newline > start + 100:
-                    end = newline
-            piece = value[start:end].strip()
+                space = value.rfind(" ", start, end)
+                best = -1
+                if newline > start:
+                    best = newline + 1
+                elif space > start:
+                    best = space + 1
+                if best > start:
+                    end = min(best, start + limit)
+            piece = value[start:end].lstrip("\r\n").rstrip("\r\n")
             if piece:
                 yield piece
             start = end
