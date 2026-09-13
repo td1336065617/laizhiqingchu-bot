@@ -221,4 +221,4 @@ sticker_plugin/
 
 ## 许可
 
-本仓库根目录未提供 `LICENSE` 文件，即未声明通用开源许可，使用与再分发请先与作者确认。仓库内置的 Emoji 字体 `assets/fonts/NotoColorEmoji.ttf` 遵循其自带许可，详见 [assets/fonts/LICENSE-NotoColorEmoji.txt](assets/fonts/LICENSE-NotoColorEmoji.txt)。
+本项目采用 **MIT 许可**，详见 [LICENSE](LICENSE)。仓库内置的 Emoji 字体 `assets/fonts/NotoColorEmoji.ttf` 遵循其自带许可，详见 [assets/fonts/LICENSE-NotoColorEmoji.txt](assets/fonts/LICENSE-NotoColorEmoji.txt)。
