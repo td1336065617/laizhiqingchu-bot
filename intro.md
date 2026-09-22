@@ -23,3 +23,6 @@ QQ 群表情包管理：回复图片即可入库、按关键词随机发送、�
 ## 管理台
 - WebUI「表情包管理」页 ─ 管理员设置、存储上限、一键备份（zip + MD5 校验清单）、恢复（合并式导入）、清空
 - 菜单与渲染自带内置 Emoji 字体，服务器不装字体也能正常显示
+## 支持平台
+- QQ 官方：qq_official / qq_official_webhook
+- QQ 非官方：aiocqhttp（OneBot v11）

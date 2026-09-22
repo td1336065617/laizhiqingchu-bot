@@ -36,6 +36,7 @@ from astrbot.api.message_components import Image, Reply
 from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, file_response, json_response, request
 
+from . import platform_compat
 from .menu_renderer import StickerMenuRenderer
 
 # 与 metadata.yaml 的 name 保持一致；注册的 Web API 路由必须带插件名前缀
@@ -233,7 +234,11 @@ class StickerPlugin(Star):
     # ------------------------------------------------------------------
     # 统一入口：精确前缀分发，未匹配的指令完全无视、不回复
     # ------------------------------------------------------------------
-    @filter.platform_adapter_type(filter.PlatformAdapterType.QQOFFICIAL)
+    @filter.platform_adapter_type(
+        filter.PlatformAdapterType.QQOFFICIAL
+        | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
+        | filter.PlatformAdapterType.AIOCQHTTP
+    )
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE
         | filter.EventMessageType.PRIVATE_MESSAGE
@@ -1221,22 +1226,15 @@ class StickerPlugin(Star):
         group = event.get_group_id()
         sender = event.get_sender_id() or "unknown"
         if group:
-            return f"group:{group}:{sender}"
-        return f"user:{sender}"
+            base = f"group:{group}:{sender}"
+        else:
+            base = f"user:{sender}"
+        return platform_compat.scoped_key(event.get_platform_id(), base)
 
     @staticmethod
     def _is_forward_event(event: AstrMessageEvent) -> bool:
-        """判断是否为合并转发（聊天记录，message_type=102）消息。"""
-        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
-        if raw is None:
-            return False
-        try:
-            return (
-                int(getattr(raw, "message_type", None) or 0)
-                == QQ_FORWARD_MESSAGE_TYPE
-            )
-        except (TypeError, ValueError):
-            return False
+        """是否为合并转发消息（官方 102 / OneBot Forward|Node|Nodes）。"""
+        return platform_compat.is_forward_event(event)
 
     async def _process_forward_add(self, event: AstrMessageEvent):
         """处于“等待合并转发”状态时，解析本次转发并批量添加。"""
@@ -1251,49 +1249,14 @@ class StickerPlugin(Star):
             )
             return
         raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
-        urls: List[str] = []
-        seen: set = set()
-        saw_forward_body = False
+        payload = await platform_compat.extract_forward(event)
+        images = list(payload.images) if payload is not None else []
+        saw_forward_body = bool(payload.saw_body) if payload is not None else False
 
-        def add_url(url: str) -> None:
-            url = (url or "").strip()
-            if url and url not in seen:
-                seen.add(url)
-                urls.append(url)
-
-        if raw is not None:
-            # 1) 嵌套消息元素（文档结构，部分场景会带真实附件）
-            elements = getattr(raw, "msg_elements", None)
-            if isinstance(elements, list) and elements:
-                saw_forward_body = True
-                for url in self._collect_forward_urls(elements):
-                    add_url(url)
-            # 2) 顶层附件（部分场景 102 直接带附件）
-            top_attachments = getattr(raw, "attachments", None) or []
-            if top_attachments:
-                saw_forward_body = True
-                for url in self._collect_forward_urls(
-                    [{"attachments": top_attachments}]
-                ):
-                    add_url(url)
-            # 3) 摘要文本：QQ 官方实际推送 102 时 msg_elements 为空，
-            #    图片 URL 内嵌在 content 的渲染摘要里（[附件1] 类型:图片 ... URL:...）
-            summary_text = getattr(raw, "content", None) or ""
-            if isinstance(summary_text, str) and summary_text.strip():
-                saw_forward_body = True
-                for url in self._extract_forward_summary_urls(summary_text):
-                    add_url(url)
-        else:
-            summary_text = event.message_str or ""
-            if summary_text.strip():
-                saw_forward_body = True
-                for url in self._extract_forward_summary_urls(summary_text):
-                    add_url(url)
-
-        if not urls:
+        if not images:
             logger.warning(
-                "StickerPlugin 102 解析失败，原始结构: %s",
-                self._describe_raw_structure(raw),
+                "StickerPlugin 合并转发解析失败，原始结构: %s",
+                platform_compat.describe_raw_structure(raw),
             )
             if saw_forward_body:
                 yield event.plain_result("该合并转发中没有解析到图片")
@@ -1301,8 +1264,7 @@ class StickerPlugin(Star):
                 yield event.plain_result("未从合并转发中解析到内容，请重试")
             return
 
-        logger.info("StickerPlugin 102 解析到 %d 张图片", len(urls))
-        images = [Image.fromURL(url) for url in urls]
+        logger.info("StickerPlugin 合并转发解析到 %d 张图片", len(images))
         keyword = state["keyword"]
         if keyword in self.blocked_keywords:
             yield event.plain_result(f"关键词 {keyword} 已被屏蔽，无法添加")
@@ -1340,145 +1302,18 @@ class StickerPlugin(Star):
 
     @classmethod
     def _collect_forward_urls(cls, elements) -> List[str]:
-        """递归提取合并转发元素中的图片 URL，返回去重后的 URL 列表。
-
-        兼容多种结构：attachments 附件、嵌套 msg_elements/elements/messages/nodes、
-        JSON 字符串 content，以及 QQ 官方 102 的渲染摘要文本。
-        """
-        urls: List[str] = []
-        seen: set = set()
-
-        def get_attr(element, key):
-            if isinstance(element, dict):
-                return element.get(key)
-            return getattr(element, key, None)
-
-        def add_url(url: str) -> None:
-            url = (url or "").strip()
-            if url and url not in seen:
-                seen.add(url)
-                urls.append(url)
-
-        def add_attachments(attachments) -> None:
-            if not isinstance(attachments, list):
-                return
-            for att in attachments:
-                url = str(get_attr(att, "url") or "").strip()
-                if not url:
-                    continue
-                ctype = str(get_attr(att, "content_type") or "").lower()
-                filename = str(
-                    get_attr(att, "filename") or get_attr(att, "name") or ""
-                )
-                ext = Path(filename).suffix.lower()
-                if (
-                    ctype.startswith("image")
-                    or ext in ALLOWED_EXTS
-                    or "multimedia.nt.qq.com.cn" in url
-                ):
-                    add_url(url)
-
-        def handle_element(element) -> None:
-            if element is None:
-                return
-            if isinstance(element, str):
-                for url in cls._extract_forward_summary_urls(element):
-                    add_url(url)
-                return
-            add_attachments(get_attr(element, "attachments"))
-            content = get_attr(element, "content")
-            if isinstance(content, str):
-                stripped = content.strip()
-                if stripped.startswith(("{", "[")):
-                    try:
-                        parsed = json.loads(stripped)
-                    except (json.JSONDecodeError, TypeError):
-                        parsed = None
-                    if isinstance(parsed, list):
-                        for item in parsed:
-                            handle_element(item)
-                    elif isinstance(parsed, dict):
-                        handle_element(parsed)
-                    else:
-                        # 形如 JSON 但不是 JSON（如 “[群聊的聊天记录]...” 摘要文本），
-                        # 回落到按摘要行提取图片 URL
-                        for url in cls._extract_forward_summary_urls(content):
-                            add_url(url)
-                else:
-                    # 非 JSON 文本：按 102 渲染摘要提取图片 URL
-                    for url in cls._extract_forward_summary_urls(content):
-                        add_url(url)
-            for key in FORWARD_NESTED_KEYS:
-                nested = get_attr(element, key)
-                if isinstance(nested, list):
-                    for item in nested:
-                        handle_element(item)
-
-        if isinstance(elements, list):
-            for element in elements:
-                handle_element(element)
-        else:
-            handle_element(elements)
-        return urls
+        """兼容层委托：递归提取合并转发元素中的图片 URL。"""
+        return platform_compat.collect_forward_urls(elements)
 
     @classmethod
     def _extract_forward_summary_urls(cls, content: str) -> List[str]:
-        """从 QQ 官方 102 摘要文本中提取图片 URL。
-
-        真实推送中 msg_elements 为空，图片信息以
-        “[附件1] 类型:图片 文件名:xxx 尺寸:... URL:https://...” 的文本行内嵌在 content 中。
-        同时兼容 “[图片] 图片1:xxx URL:...” 的变体。
-        """
-        if not content:
-            return []
-        urls: List[str] = []
-        seen: set = set()
-
-        def add_url(url: str) -> None:
-            url = (url or "").strip()
-            if url and url not in seen:
-                seen.add(url)
-                urls.append(url)
-
-        for line in content.splitlines():
-            if "URL:" not in line or not any(
-                marker in line for marker in FORWARD_SUMMARY_MARKERS
-            ):
-                continue
-            type_match = re.search(r"类型:\s*([^\s]+)", line)
-            if type_match and type_match.group(1) != "图片":
-                # 附件行带类型且不是图片（如 类型:文件/视频/语音），跳过
-                continue
-            for m in FORWARD_URL_RE.finditer(line):
-                add_url(m.group(1))
-        if not urls:
-            # 兜底：摘要中直接出现的 QQ 附件下载地址
-            for m in re.finditer(
-                r"https://multimedia\.nt\.qq\.com\.cn/download\?\S+", content
-            ):
-                add_url(m.group(0))
-        return urls
+        """兼容层委托：从 QQ 官方 102 摘要文本中提取图片 URL。"""
+        return platform_compat.extract_forward_summary_urls(content)
 
     @staticmethod
     def _describe_raw_structure(raw) -> str:
-        """简要描述 102 原始消息结构（只打印键名与短文本，避免刷爆日志）。"""
-        if raw is None:
-            return "raw=None"
-        if isinstance(raw, dict):
-            return "keys=" + ",".join(str(k) for k in raw.keys())
-        attrs = [
-            name
-            for name in ("content", "message_type", "attachments", "msg_elements")
-            if hasattr(raw, name)
-        ]
-        text = getattr(raw, "content", None)
-        raw_data = getattr(raw, "raw_data", None)
-        desc = "attrs=" + ",".join(attrs)
-        if isinstance(raw_data, dict):
-            desc += "; raw_data_keys=" + ",".join(str(k) for k in raw_data.keys())
-        if isinstance(text, str) and text:
-            desc += "; content_head=" + repr(text[:300])
-        return desc
+        """兼容层委托：简要描述原始消息结构。"""
+        return platform_compat.describe_raw_structure(raw)
 
     @staticmethod
     def _is_valid_keyword(keyword: str) -> bool:
@@ -1509,11 +1344,16 @@ class StickerPlugin(Star):
             for a in (self.config.get("admin_users", []) or [])
             if str(a).strip()
         ]
-        sender_id = event.get_sender_id()
-        is_admin = sender_id in admins
+        sender_id = str(event.get_sender_id() or "")
+        platform_id = str(event.get_platform_id() or "")
+        is_admin = any(
+            platform_compat.admin_entry_matches(entry, platform_id, sender_id)
+            for entry in admins
+        )
         if not is_admin:
             logger.warning(
-                "StickerPlugin 管理员校验未通过: sender_id=%s admin_users=%s",
+                "StickerPlugin 管理员校验未通过: platform=%s sender_id=%s admin_users=%s",
+                platform_id,
                 sender_id,
                 admins,
             )

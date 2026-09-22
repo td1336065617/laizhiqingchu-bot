@@ -7,6 +7,22 @@
 
 ---
 
+## [1.2.0] - 2026-09-22
+
+> QQ 双通道适配：支持 OneBot v11（aiocqhttp），官方族行为零回归。
+
+### ✨ 新增
+- 新增 platform_compat.py：合并转发双解析（官方 102 / OneBot get_forward_msg）。
+- 管理员列表支持「平台ID:用户ID」精确限定，旧配置继续兼容。
+
+### ⚙️ 变更
+- support_platforms 增加 qq_official_webhook、aiocqhttp。
+
+### 🧪 真机验证
+- 已用 NapCat（OneBot v11）验证：回复图片添加、来只发送、合并转发批量添加（get_forward_msg）。
+
+---
+
 ## [1.1.20] - 2026-09-18
 
 > 📖 根目录提供 `intro.md`，可被「菜单导航」插件的 `插件介绍` 指令聚合展示。
