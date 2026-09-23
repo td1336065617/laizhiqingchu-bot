@@ -7,6 +7,19 @@
 
 ---
 
+## [1.2.1] - 2026-09-23
+
+> 🐛 Windows 兼容：浏览器与中文字体探测补 Windows 路径；补 requirements.txt。
+
+### ✨ 新增
+- 浏览器 / 中文字体 / Emoji 字体候选新增 Windows 常见路径（Chrome / Edge / Firefox、msyh.ttc 等、seguiemj.ttf）。
+- 新增 requirements.txt，声明 Pillow 依赖。
+
+### ⚙️ 变更
+- 新增候选在非 Windows 平台不存在，**Linux/macOS 行为不变**。
+
+---
+
 ## [1.2.0] - 2026-09-22
 
 > QQ 双通道适配：支持 OneBot v11（aiocqhttp），官方族行为零回归。

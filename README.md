@@ -15,7 +15,7 @@
 WebUI「表情包管理」页 ──► 管理员设置 · 立即备份（zip）· 上传恢复 · 清空
 ```
 
-- **版本**：1.2.0 ｜ **平台**：`qq_official` / `qq_official_webhook` / `aiocqhttp`（AstrBot ≥ 4.13.0）｜ **作者**：td1336065617
+- **版本**：1.2.1 ｜ **平台**：`qq_official` / `qq_official_webhook` / `aiocqhttp`（AstrBot ≥ 4.13.0）｜ **作者**：td1336065617
 - **数据位置**：AstrBot 数据目录下的 `stickers/`，通常是 `data/stickers/`
 
 ---
@@ -227,3 +227,19 @@ sticker_plugin/
 ## 许可
 
 本项目采用 **MIT 许可**，详见 [LICENSE](LICENSE)。仓库内置的 Emoji 字体 `assets/fonts/NotoColorEmoji.ttf` 遵循其自带许可，详见 [assets/fonts/LICENSE-NotoColorEmoji.txt](assets/fonts/LICENSE-NotoColorEmoji.txt)。
+
+---
+
+## Windows 支持
+
+Windows 上 Chromium / Firefox 通常不在 PATH，插件已内置常见安装路径探测
+（Chrome / Edge / Firefox），并内置 Windows 系统字体（微软雅黑 / 黑体 / 宋体 / 等线）
+与 Emoji 字体（Segoe UI Emoji）。
+
+若仍拿不到图片，可显式指定（不改代码）：
+
+```bat
+set STICKER_MENU_RENDERER=C:\Program Files\Google\Chrome\Application\chrome.exe
+set STICKER_MENU_FONT=C:\Windows\Fonts\msyh.ttc
+set STICKER_MENU_FONT_INDEX=0
+```
