@@ -15,7 +15,7 @@
 WebUI「表情包管理」页 ──► 管理员设置 · 立即备份（zip）· 上传恢复 · 清空
 ```
 
-- **版本**：1.2.1 ｜ **平台**：`qq_official` / `qq_official_webhook` / `aiocqhttp`（AstrBot ≥ 4.13.0）｜ **作者**：td1336065617
+- **平台**：`qq_official` / `qq_official_webhook` / `aiocqhttp`（AstrBot ≥ 4.13.0）｜ **作者**：td1336065617；版本号与更新内容见 [CHANGELOG.md](CHANGELOG.md)
 - **数据位置**：AstrBot 数据目录下的 `stickers/`，通常是 `data/stickers/`
 
 ---
@@ -191,6 +191,20 @@ config/sticker_plugin_config.json   # 插件自管理配置（管理员列表 / 
 
 ---
 
+## Windows 支持
+
+Windows 上 Chromium / Firefox 通常不在 PATH，插件已内置常见安装路径探测
+（Chrome / Edge / Firefox），并内置 Windows 系统字体（微软雅黑 / 黑体 / 宋体 / 等线）
+与 Emoji 字体（Segoe UI Emoji）。
+
+若仍拿不到图片，可显式指定（不改代码）：
+
+```bat
+set STICKER_MENU_RENDERER=C:\Program Files\Google\Chrome\Application\chrome.exe
+set STICKER_MENU_FONT=C:\Windows\Fonts\msyh.ttc
+set STICKER_MENU_FONT_INDEX=0
+```
+
 ## 开发
 
 ```text
@@ -210,15 +224,9 @@ sticker_plugin/
 
 ---
 
-## 更新
+## 相关文档
 
-1. `git pull` 拉取最新代码，并查看 [CHANGELOG.md](CHANGELOG.md) 了解本次改动；
-2. 把插件文件同步到 `AstrBot/data/plugins/sticker_plugin/`；
-3. 在 AstrBot WebUI 插件管理页重载插件（或重启 AstrBot）。
-
-`stickers/`、`sticker_backups/`、`sticker_menu_cache/` 与 `config/` 下的数据不会被覆盖，更新不会丢失表情包。
-
----
+- [更新日志](CHANGELOG.md)：每个版本的新增与修复
 
 ## 免责声明
 
@@ -230,16 +238,3 @@ sticker_plugin/
 
 ---
 
-## Windows 支持
-
-Windows 上 Chromium / Firefox 通常不在 PATH，插件已内置常见安装路径探测
-（Chrome / Edge / Firefox），并内置 Windows 系统字体（微软雅黑 / 黑体 / 宋体 / 等线）
-与 Emoji 字体（Segoe UI Emoji）。
-
-若仍拿不到图片，可显式指定（不改代码）：
-
-```bat
-set STICKER_MENU_RENDERER=C:\Program Files\Google\Chrome\Application\chrome.exe
-set STICKER_MENU_FONT=C:\Windows\Fonts\msyh.ttc
-set STICKER_MENU_FONT_INDEX=0
-```
