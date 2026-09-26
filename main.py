@@ -338,7 +338,7 @@ class StickerPlugin(Star):
             yield event.plain_result("用法：添加{关键词}（请回复包含图片的消息）")
             return
         if not self._is_valid_keyword(keyword):
-            yield event.plain_result("关键词不合法")
+            yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
         if keyword in self.blocked_keywords:
             yield event.plain_result(f"关键词 {keyword} 已被屏蔽，无法添加")
@@ -390,7 +390,7 @@ class StickerPlugin(Star):
             yield event.plain_result("用法：批量添加合并转发{关键词}")
             return
         if not self._is_valid_keyword(keyword):
-            yield event.plain_result("关键词不合法")
+            yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
         if keyword in self.blocked_keywords:
             yield event.plain_result(f"关键词 {keyword} 已被屏蔽，无法添加")
@@ -471,7 +471,7 @@ class StickerPlugin(Star):
             yield event.plain_result("用法：来只{关键词}")
             return
         if not self._is_valid_keyword(keyword):
-            yield event.plain_result("关键词不合法")
+            yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
         if keyword in self.blocked_keywords:
             yield event.plain_result(f"关键词 {keyword} 已被屏蔽，无法发送")
@@ -500,7 +500,7 @@ class StickerPlugin(Star):
             yield event.plain_result("用法：列表{关键词}{页码}（页码可选）")
             return
         if not self._is_valid_keyword(keyword):
-            yield event.plain_result("关键词不合法")
+            yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
         if keyword in self.blocked_keywords:
             yield event.plain_result(f"关键词 {keyword} 已被屏蔽")
@@ -553,7 +553,7 @@ class StickerPlugin(Star):
             yield event.plain_result("用法：删图（回复要删除的图片），或删图{关键词}{序号}")
             return
         if not self._is_valid_keyword(keyword):
-            yield event.plain_result("关键词不合法")
+            yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
 
         files = self._prune_missing(keyword)
@@ -594,7 +594,7 @@ class StickerPlugin(Star):
         """
         keyword = message_str[2:].strip()
         if keyword and not self._is_valid_keyword(keyword):
-            yield event.plain_result("关键词不合法")
+            yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
 
         # 待扫描的关键词目录：限定关键词，或全部已索引关键词
@@ -698,7 +698,7 @@ class StickerPlugin(Star):
             yield event.plain_result("用法：删除{关键词}")
             return
         if not self._is_valid_keyword(keyword):
-            yield event.plain_result("关键词不合法")
+            yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
 
         sender_id = event.get_sender_id()
@@ -1163,7 +1163,7 @@ class StickerPlugin(Star):
             yield event.plain_result("用法：屏蔽{关键词}")
             return
         if not self._is_valid_keyword(keyword):
-            yield event.plain_result("关键词不合法")
+            yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
         if keyword in self.blocked_keywords:
             yield event.plain_result(f"关键词 {keyword} 已在屏蔽列表中")
@@ -1315,6 +1315,13 @@ class StickerPlugin(Star):
         """兼容层委托：简要描述原始消息结构。"""
         return platform_compat.describe_raw_structure(raw)
 
+    #: Windows 会把这些名字当设备名，not 目录名；创建目录会失败（BUG-022）
+    _WINDOWS_RESERVED = frozenset(
+        {"CON", "PRN", "AUX", "NUL"}
+        | {f"COM{i}" for i in range(1, 10)}
+        | {f"LPT{i}" for i in range(1, 10)}
+    )
+
     @staticmethod
     def _is_valid_keyword(keyword: str) -> bool:
         if not keyword:
@@ -1322,6 +1329,11 @@ class StickerPlugin(Star):
         if keyword in RESERVED_KEYWORDS:
             return False
         if re.search(r"\s", keyword):
+            return False
+        # Windows 保留名（含扩展名形式，如 con.txt）与结尾点/空格：目录建不出来
+        if keyword.split(".")[0].upper() in StickerPlugin._WINDOWS_RESERVED:
+            return False
+        if keyword != keyword.rstrip(" ."):
             return False
         # 防御非法目录名 / 路径穿越
         if keyword in (".", "..") or "/" in keyword or "\\" in keyword:

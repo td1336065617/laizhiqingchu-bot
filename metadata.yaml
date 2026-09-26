@@ -7,7 +7,7 @@ desc: |
   屏蔽关键词、存储统计与超容量警告；备份/恢复/管理员设置可在
   AstrBot WebUI 的“表情包管理”页完成。数据保存在 data/stickers/ 目录下。
   支持 QQ 官方机器人（qq_official / qq_official_webhook）与 OneBot v11（aiocqhttp）。
-version: 1.2.1
+version: 1.2.2
 author: td1336065617
 repo: https://github.com/td1336065617/laizhiqingchu-bot/tree/master
 astrbot_version: ">=4.13.0"
