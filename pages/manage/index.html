@@ -50,6 +50,23 @@
 </div>
 
 <div class="card">
+  <h2>AI 能力（工具）</h2>
+  <div class="row"><label><input type="checkbox" id="aiToolsOn"> 开启 AI 工具（总开关）</label></div>
+  <div class="row"><label><input type="checkbox" id="aiReadOn"> 允许 AI 只读（统计 / 列表，仅管理员）</label></div>
+  <div class="row"><label><input type="checkbox" id="aiSendOn"> 允许 AI 主动发表情包</label></div>
+  <div class="row">
+    <label>发表情包节流：窗口内最多</label>
+    <input type="number" id="aiThrottleLimit" min="1" max="60">
+    <label>次 / 窗口秒数</label>
+    <input type="number" id="aiThrottleWindow" min="5" max="3600">
+  </div>
+  <div class="row">
+    <label>同一会话同一关键词多少秒内不重复发图</label>
+    <input type="number" id="aiSendDedup" min="0" max="600">
+  </div>
+  <div class="muted" style="margin-top:8px">关掉开关立即生效；只影响 AI，人类指令完全不受影响。</div>
+</div>
+<div class="card">
   <h2>备份与恢复</h2>
   <div class="row" style="margin-bottom:12px">
     <button id="btnBackup">立即备份（打包 zip）</button>
@@ -149,6 +166,14 @@
       adminUsers = (r && Array.isArray(r.admin_users) ? r.admin_users : []).slice();
       maxStorageMb = (r && r.max_storage_mb) || 200;
       document.getElementById('mbInput').value = maxStorageMb;
+      const ai = (r && r.ai) || {};
+      const pickAi = (key, fallback) => (ai[key] === undefined || ai[key] === null ? fallback : ai[key]);
+      document.getElementById('aiToolsOn').checked = pickAi('sticker_ai_tools_enabled', true) !== false;
+      document.getElementById('aiReadOn').checked = pickAi('sticker_ai_read_enabled', true) !== false;
+      document.getElementById('aiSendOn').checked = pickAi('sticker_ai_send_enabled', true) !== false;
+      document.getElementById('aiThrottleLimit').value = pickAi('sticker_ai_throttle_limit', 3);
+      document.getElementById('aiThrottleWindow').value = pickAi('sticker_ai_throttle_window', 60);
+      document.getElementById('aiSendDedup').value = pickAi('sticker_ai_send_dedup_window', 10);
       renderAdmins();
     } catch (e) {
       show('加载配置失败：' + (e && e.message ? e.message : e), true);
@@ -221,7 +246,15 @@
       input.value = '';
       renderAdmins();
       const mb = Number(document.getElementById('mbInput').value);
-      const r = await A.apiPost('config', { admin_users: adminUsers, max_storage_mb: mb });
+      const ai = {
+        sticker_ai_tools_enabled: document.getElementById('aiToolsOn').checked,
+        sticker_ai_read_enabled: document.getElementById('aiReadOn').checked,
+        sticker_ai_send_enabled: document.getElementById('aiSendOn').checked,
+        sticker_ai_throttle_limit: Number(document.getElementById('aiThrottleLimit').value),
+        sticker_ai_throttle_window: Number(document.getElementById('aiThrottleWindow').value),
+        sticker_ai_send_dedup_window: Number(document.getElementById('aiSendDedup').value),
+      };
+      const r = await A.apiPost('config', { admin_users: adminUsers, max_storage_mb: mb, ai: ai });
       show('配置已保存并生效');
       await loadConfig();
     } catch (e) {

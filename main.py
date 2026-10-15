@@ -31,13 +31,19 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image, Reply
 from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, file_response, json_response, request
 
 from . import platform_compat
 from .menu_renderer import StickerMenuRenderer
+
+try:                      # AI 公共件（纯逻辑，四仓库各一份）
+    from . import ai_common, ai_impl
+except ImportError:       # 测试里以顶层模块导入
+    import ai_common
+    import ai_impl
 
 # 与 metadata.yaml 的 name 保持一致；注册的 Web API 路由必须带插件名前缀
 PLUGIN_NAME = "sticker_plugin"
@@ -74,6 +80,26 @@ PAGE_SIZE = 10
 DEFAULT_MAX_STORAGE_MB = 200
 # 允许保留的图片扩展名（convert_to_file_path 可能返回无后缀的临时文件）
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+#: AI 能力默认值（插件自管配置，读写都在 WebUI 页面）
+AI_CONFIG_DEFAULTS: dict = {
+    "sticker_ai_tools_enabled": True,
+    "sticker_ai_read_enabled": True,      # 统计 / 列表
+    "sticker_ai_send_enabled": True,      # 随机发表情包（会改变聊天风格，可关）
+    "sticker_ai_throttle_limit": 3,       # 发送类节流：窗口内最多几次
+    "sticker_ai_throttle_window": 60,
+    "sticker_ai_send_dedup_window": 10,   # 同会话同关键词多少秒内不重复发图
+}
+AI_BOOL_KEYS = (
+    "sticker_ai_tools_enabled",
+    "sticker_ai_read_enabled",
+    "sticker_ai_send_enabled",
+)
+AI_INT_BOUNDS: dict = {
+    "sticker_ai_throttle_limit": (1, 60),
+    "sticker_ai_throttle_window": (5, 3600),
+    "sticker_ai_send_dedup_window": (0, 600),
+}
 
 MENU_TEXT = "\n".join(
     (
@@ -172,6 +198,9 @@ class StickerPlugin(Star):
         self.blocked_keywords: set = set()
         # 等待合并转发的添加状态：{key: {"keyword": str, "time": float}}
         self.pending_forward_add: dict = {}
+        # AI 工具：节流器 + 发送幂等记录（同会话同关键词窗口内不重复发图）
+        self._ai_throttle = None
+        self._ai_send_log: dict = {}
         self._load_index()
         self._load_blocked()
         self._check_storage()
@@ -483,7 +512,10 @@ class StickerPlugin(Star):
             yield event.plain_result(f"关键词 {keyword} 下还不存在图片")
             return
 
-        filename = random.choice(files)
+        filename = ai_impl.pick_sticker(files)   # 与 AI 工具同源
+        if not filename:
+            yield event.plain_result("关键词 %s 下还不存在图片" % keyword)
+            return
         image_path = (self.data_dir / keyword / filename).resolve()
         yield event.image_result(str(image_path))
 
@@ -511,17 +543,11 @@ class StickerPlugin(Star):
             yield event.plain_result("该关键词下没有图片")
             return
 
-        total_pages = (len(files) + PAGE_SIZE - 1) // PAGE_SIZE
-        if page < 1 or page > total_pages:
-            yield event.plain_result("页码超出范围")
+        result = ai_impl.list_lines(files, page, PAGE_SIZE)   # 与 AI 工具同源
+        if not result.get("ok"):
+            yield event.plain_result(result.get("reason") or "没有数据")
             return
-
-        start = (page - 1) * PAGE_SIZE
-        lines = [
-            f"[{idx}] {name}"
-            for idx, name in enumerate(files[start : start + PAGE_SIZE], start=start + 1)
-        ]
-        lines.append(f"第 {page}/{total_pages} 页，共 {len(files)} 张")
+        lines = list(result["lines"])
         yield event.plain_result("\n".join(lines))
 
     # ------------------------------------------------------------------
@@ -745,16 +771,11 @@ class StickerPlugin(Star):
             yield event.plain_result("暂无任何表情包数据")
             return
 
-        total_keywords = len(self.index)
-        total_images = sum(len(v) for v in self.index.values())
-        top3 = sorted(self.index.items(), key=lambda item: len(item[1]), reverse=True)[:3]
-        lines = [
-            f"关键词数：{total_keywords}",
-            f"图片总数：{total_images}",
-            "图片数 Top 3：",
-        ]
-        for keyword, files in top3:
-            lines.append(f"{keyword}: {len(files)} 张")
+        result = ai_impl.stats_lines(self.index, top=3)   # 与 AI 工具同源
+        if not result.get("ok"):
+            yield event.plain_result(result.get("reason") or "暂无数据")
+            return
+        lines = list(result["lines"])
         yield event.plain_result("\n".join(lines))
 
     # ------------------------------------------------------------------
@@ -778,6 +799,236 @@ class StickerPlugin(Star):
     # ------------------------------------------------------------------
     # G. WebUI 备份 / 恢复（AstrBot 管理面板后台）
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # AI 能力：sticker_send（所有人；屏蔽校验 + 节流 + 10s 幂等窗口）
+    #           sticker_stats / sticker_list（管理员只读）
+    #   取数逻辑与「来只{}」「列表」「统计」指令同源（ai_impl），不写盘、不改索引。
+    # ------------------------------------------------------------------
+    def _ai_settings(self) -> dict:
+        """读 AI 配置：缺键回落默认值，越界值回默认（页面侧还会再校验一次）。"""
+        values: dict = {}
+        for key, default in AI_CONFIG_DEFAULTS.items():
+            values[key] = self.config.get(key, default)
+        for key in AI_BOOL_KEYS:
+            values[key] = ai_common.to_bool(values.get(key), default=AI_CONFIG_DEFAULTS[key])
+        for key, (low, high) in AI_INT_BOUNDS.items():
+            parsed = ai_common.parse_int(values.get(key), low, high)
+            values[key] = parsed if parsed is not None else AI_CONFIG_DEFAULTS[key]
+        return values
+
+    def _apply_ai_payload(self, patch: dict) -> dict:
+        """保存页面传来的 AI 配置：非法/越界一律报错，不静默改数。"""
+        updated: dict = {}
+        for key in AI_BOOL_KEYS:
+            if key in patch:
+                value = ai_common.to_bool(patch.get(key), default=AI_CONFIG_DEFAULTS[key])
+                self.config[key] = value
+                updated[key] = value
+        for key, (low, high) in AI_INT_BOUNDS.items():
+            if key in patch:
+                value = ai_common.parse_int(patch.get(key), low, high)
+                if value is None:
+                    raise ValueError("%s 必须是 %d~%d 的整数" % (key, low, high))
+                self.config[key] = value
+                updated[key] = value
+        return updated
+
+    async def _ai_guard(self, event: AstrMessageEvent, tool: str, *, send: bool = False):
+        """统一门禁：开关（读/发分开）+ 节流（按调用者）；被拒返回错误 JSON 文本。"""
+        settings = self._ai_settings()
+        if not settings["sticker_ai_tools_enabled"]:
+            return ai_common.fail("disabled", "表情包的 AI 工具已在配置里关闭", hint="管理员可在插件页打开")
+        if send and not settings["sticker_ai_send_enabled"]:
+            return ai_common.fail("disabled", "AI 主动发表情包已关闭（只读工具仍可用）")
+        if not send and not settings["sticker_ai_read_enabled"]:
+            return ai_common.fail("disabled", "表情包的 AI 只读工具已在配置里关闭")
+        limit = int(settings["sticker_ai_throttle_limit"])
+        window = int(settings["sticker_ai_throttle_window"])
+        throttle = getattr(self, "_ai_throttle", None)
+        if throttle is None or (throttle.limit, throttle.window) != (limit, window):
+            throttle = ai_common.ToolThrottle(limit=limit, window=window)
+            self._ai_throttle = throttle
+        sender = "-"
+        try:
+            sender = str(event.get_sender_id() or "-")
+        except Exception:
+            sender = "-"
+        key = "%s:%s" % (str(getattr(event, "unified_msg_origin", "") or "unknown"), sender)
+        wait = throttle.check(tool, key)
+        if wait:
+            return ai_common.fail("throttled", "发得太快了，请 %d 秒后再试" % wait, retry_after=wait)
+        return None
+
+    def _read_index_files(self, keyword: str) -> list:
+        """只读取数：索引里的文件名 → 过滤掉文件已丢的条目（**不写盘**）。"""
+        folder = self.data_dir / keyword
+        files = (self.index or {}).get(keyword, []) or []
+        return ai_impl.existing_files(files, lambda name: (folder / name).is_file())
+
+    def _ai_recent_send(self, session: str, keyword: str, window: int) -> Optional[dict]:
+        """同会话同关键词在窗口内的上次发送结果（GR-12 幂等）；无则 None。"""
+        if window <= 0:
+            return None
+        entry = self._ai_send_log.get((session, keyword))
+        if not entry:
+            return None
+        stamp, payload = entry
+        if time.time() - float(stamp) > float(window):
+            return None
+        return dict(payload)
+
+    def _ai_note_send(self, session: str, keyword: str, payload: dict) -> None:
+        self._ai_send_log[(session, keyword)] = (time.time(), dict(payload))
+        if len(self._ai_send_log) > 512:   # 长跑进程的简单上限
+            for key in list(self._ai_send_log)[:256]:
+                self._ai_send_log.pop(key, None)
+
+    @filter.llm_tool(name="sticker_send")
+    async def sticker_send(self, event: AstrMessageEvent, **kwargs) -> str:
+        """随机发一张表情包（直接把图片发到当前会话）。
+
+        何时使用：用户说"发个猫的表情包/来个乐子"时。
+        何时别用：不确定关键词时先用 sticker_stats 看看有什么；短时间不要重复调用。
+
+        Args:
+            keyword(string): 必填，表情包关键词（如 猫、点赞）。
+        """
+        blocked = await self._ai_guard(event, "sticker_send", send=True)
+        if blocked:
+            return blocked
+        keyword = ai_impl.keyword_or_empty((kwargs or {}).get("keyword"))
+        if not keyword:
+            return ai_common.fail("invalid_argument", "缺少 keyword（表情包关键词）", field="keyword")
+        reason = ai_impl.block_reason(keyword, self.blocked_keywords)
+        if reason:
+            # 设计 §7.2：屏蔽关键词按 disabled 回报（便于 AI 区分"功能被关"与"关键词被屏蔽"）
+            return ai_common.fail("disabled", "该关键词不可用", keyword=keyword)
+        if len(keyword) > ai_impl.KEYWORD_MAX_LEN:
+            return ai_common.fail(
+                "invalid_argument",
+                "关键词过长（最多 %d 字）" % ai_impl.KEYWORD_MAX_LEN,
+                field="keyword",
+            )
+        if not self._is_valid_keyword(keyword):
+            return ai_common.fail("invalid_argument", "关键词不合法（保留名/结尾点号等）", field="keyword")
+        files = self._read_index_files(keyword)
+        if not files:
+            hint = ai_impl.keyword_hint(self.index, keyword)
+            return ai_common.fail(
+                "not_found",
+                "关键词「%s」下没有图片" % keyword,
+                hint=("可用关键词：" + "、".join(hint)) if hint else "还没有任何表情包",
+            )
+        session = str(getattr(event, "unified_msg_origin", "") or "")
+        window = int(self._ai_settings()["sticker_ai_send_dedup_window"])
+        recent = self._ai_recent_send(session, keyword, window)
+        if recent is not None:
+            recent.update({"deduped": True, "note": "%d 秒内已经发过同关键词的表情包，没有重复发送" % window})
+            return ai_common.ok(recent)
+        filename = ai_impl.pick_sticker(files)
+        if not filename:
+            return ai_common.fail("not_found", "没有挑到可用的图片")
+        path = (self.data_dir / keyword / filename).resolve()
+        payload = {
+            "keyword": keyword,
+            "file": filename,
+            "count": len(files),
+            "deduped": False,
+            "text": "已发送关键词「%s」下的 1 张表情包" % keyword,
+        }
+        # 先占位再发送：并发同会话同关键词只有一路真正发出去（GR-12）
+        self._ai_note_send(session, keyword, payload)
+        try:
+            await event.send(MessageChain([Image.fromFileSystem(str(path))]))
+        except Exception as exc:
+            self._ai_send_log.pop((session, keyword), None)   # 失败回滚，允许重试
+            logger.warning("AI 发表情包失败: %s", exc)
+            return ai_common.fail("capability_unavailable", "表情包没能发出去（平台拒绝或文件不可读）")
+        logger.info("AI 工具 sticker_send 命中（keyword=%s）", keyword)
+        return ai_common.ok(payload)
+
+    @filter.llm_tool(name="sticker_stats")
+    async def sticker_stats(self, event: AstrMessageEvent, **kwargs) -> str:
+        """查看表情包库统计：关键词数、图片总数、图片最多的前 3 个关键词（管理员）。
+
+        何时使用：管理员问"表情包有多少/哪些关键词最多"。
+        何时别用：要看具体文件名用 sticker_list。
+        """
+        blocked = await self._ai_guard(event, "sticker_stats")
+        if blocked:
+            return blocked
+        if not self._is_admin(event):
+            return ai_common.fail("permission_denied", "统计仅管理员可用")
+        result = ai_impl.stats_lines(self.index, top=3)
+        if not result.get("ok"):
+            return ai_common.fail("not_found", result.get("reason") or "暂无数据")
+        logger.info("AI 工具 sticker_stats 命中")
+        return ai_common.ok(
+            {
+                "total_keywords": result["total_keywords"],
+                "total_images": result["total_images"],
+                "top": result["top"],
+                "text": "\n".join(result["lines"]),
+            }
+        )
+
+    @filter.llm_tool(name="sticker_list")
+    async def sticker_list(self, event: AstrMessageEvent, **kwargs) -> str:
+        """分页列出某个关键词下的表情包文件名（管理员，每页 10 张）。
+
+        何时使用：管理员问"猫这个关键词里都有哪些图"。
+        何时别用：只看数量用 sticker_stats。
+
+        Args:
+            keyword(string): 必填，表情包关键词。
+            page(number): 可选，第几页，默认 1。
+        """
+        blocked = await self._ai_guard(event, "sticker_list")
+        if blocked:
+            return blocked
+        if not self._is_admin(event):
+            return ai_common.fail("permission_denied", "列表仅管理员可用")
+        keyword = ai_impl.keyword_or_empty((kwargs or {}).get("keyword"))
+        if not keyword:
+            return ai_common.fail("invalid_argument", "缺少 keyword（表情包关键词）", field="keyword")
+        reason = ai_impl.block_reason(keyword, self.blocked_keywords)
+        if reason:
+            return ai_common.fail("permission_denied", reason)
+        if len(keyword) > ai_impl.KEYWORD_MAX_LEN:
+            return ai_common.fail(
+                "invalid_argument",
+                "关键词过长（最多 %d 字）" % ai_impl.KEYWORD_MAX_LEN,
+                field="keyword",
+            )
+        if not self._is_valid_keyword(keyword):
+            return ai_common.fail("invalid_argument", "关键词不合法（保留名/路径字符等）", field="keyword")
+        raw_page = (kwargs or {}).get("page")
+        if str(raw_page or "").strip():
+            page = ai_common.parse_int(raw_page, 1, 1000)
+            if page is None:
+                return ai_common.fail("invalid_argument", "page 只能是正整数", field="page")
+        else:
+            page = 1
+        files = self._read_index_files(keyword)
+        result = ai_impl.list_lines(files, page, PAGE_SIZE)
+        if not result.get("ok"):
+            hint = ai_impl.keyword_hint(self.index, keyword)
+            return ai_common.fail(
+                "not_found",
+                result.get("reason") or "没有数据",
+                hint=("可用关键词：" + "、".join(hint)) if hint else "",
+            )
+        logger.info("AI 工具 sticker_list 命中（keyword=%s, page=%s）", keyword, page)
+        return ai_common.ok(
+            {
+                "keyword": keyword,
+                "page": result["page"],
+                "total_pages": result["total_pages"],
+                "total": result["total"],
+                "items": result["items"],
+                "text": "\n".join(result["lines"]),
+            }
+        )
     async def _web_config_get(self):
         return json_response(
             {
@@ -787,6 +1038,7 @@ class StickerPlugin(Star):
                         str(a) for a in (self.config.get("admin_users", []) or [])
                     ],
                     "max_storage_mb": self._max_storage_mb(),
+                    "ai": self._ai_settings(),
                 },
             }
         )
@@ -812,7 +1064,18 @@ class StickerPlugin(Star):
 
     def _apply_config_payload(self, payload: dict) -> dict:
         """校验并保存后台配置，返回实际更新的字段。"""
+        # 先整体校验到临时表，全部通过再落内存：避免"admin 已改、ai 报错"的半状态
+        snapshot = dict(self.config)
         updated: dict = {}
+
+        try:
+            return self._apply_config_payload_inner(payload, updated)
+        except Exception:
+            self.config.clear()
+            self.config.update(snapshot)   # 回滚内存，磁盘本来就没写
+            raise
+
+    def _apply_config_payload_inner(self, payload: dict, updated: dict) -> dict:
         if "admin_users" in payload:
             admins = payload["admin_users"]
             if not isinstance(admins, list):
@@ -833,6 +1096,9 @@ class StickerPlugin(Star):
                 raise ValueError("max_storage_mb 必须大于 0")
             self.config["max_storage_mb"] = limit
             updated["max_storage_mb"] = limit
+        ai_patch = payload.get("ai")
+        if isinstance(ai_patch, dict):
+            updated["ai"] = self._apply_ai_payload(ai_patch)
         try:
             self.config.save_config()
         except Exception as exc:
