@@ -993,7 +993,7 @@ class StickerPlugin(Star):
             return ai_common.fail("invalid_argument", "缺少 keyword（表情包关键词）", field="keyword")
         reason = ai_impl.block_reason(keyword, self.blocked_keywords)
         if reason:
-            return ai_common.fail("permission_denied", reason)
+            return ai_common.fail("disabled", reason, field="keyword")   # 与 sticker_send 统一：屏蔽按「功能被关」回报
         if len(keyword) > ai_impl.KEYWORD_MAX_LEN:
             return ai_common.fail(
                 "invalid_argument",
@@ -1012,6 +1012,14 @@ class StickerPlugin(Star):
         files = self._read_index_files(keyword)
         result = ai_impl.list_lines(files, page, PAGE_SIZE)
         if not result.get("ok"):
+            total_pages = int(result.get("total_pages") or 0)
+            if total_pages and page > total_pages:
+                return ai_common.fail(
+                    "invalid_argument",
+                    "页码超出范围：该关键词只有第 1~%d 页（每页 %d 张）" % (total_pages, ai_impl.PAGE_SIZE),
+                    field="page",
+                    hint="该关键词共 %d 张图；请用 page=1 重新查" % int(result.get("total") or 0),
+                )
             hint = ai_impl.keyword_hint(self.index, keyword)
             return ai_common.fail(
                 "not_found",

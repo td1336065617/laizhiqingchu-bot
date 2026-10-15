@@ -171,10 +171,12 @@ def test_stats_and_list_share_command_output(tmp_path) -> None:
 
 
 def test_list_page_out_of_range(tmp_path) -> None:
+    """页码越界：新契约见 test_list_page_out_of_range_reports_valid_range。"""
     _main, bot = make_bot(tmp_path, index={"猫": ["a.png"]})
+    add_files(tmp_path, "猫", ["a.png"])
     bot._is_admin = lambda event: True
     data = payload(run(bot.sticker_list(FakeEvent(), keyword="猫", page=9)))
-    assert data["ok"] is False and data["error"]["code"] == "not_found"
+    assert data["ok"] is False
 
 
 def test_read_tools_do_not_write_index(tmp_path) -> None:
@@ -326,3 +328,25 @@ def test_send_failure_allows_retry(tmp_path) -> None:
     second = payload(run(bot.sticker_send(event, keyword="猫")))
     assert second["ok"] is True and second["data"]["deduped"] is False, second
     assert len(event.sent) == 1
+
+
+def test_list_page_out_of_range_reports_valid_range(tmp_path) -> None:
+    """F6：页码越界要 invalid_argument 且给出合法范围（模型才能自救）。"""
+    _main, bot = make_bot(tmp_path, index={"猫": ["a.png"]})
+    add_files(tmp_path, "猫", ["a.png"])
+    bot._is_admin = lambda event: True
+    data = payload(run(bot.sticker_list(FakeEvent(), keyword="猫", page=9)))
+    assert data["ok"] is False
+    assert data["error"]["code"] == "invalid_argument", data
+    assert "1~1" in str(data["error"]["message"]), data
+
+
+def test_list_blocked_keyword_uses_disabled_code(tmp_path) -> None:
+    """F7：屏蔽关键词在 list 与 send 上用同一个错误码（设计 §7.2：disabled）。"""
+    _main, bot = make_bot(tmp_path, blocked={"猫"}, index={"猫": ["a.png"]})
+    add_files(tmp_path, "猫", ["a.png"])
+    bot._is_admin = lambda event: True
+    listing = payload(run(bot.sticker_list(FakeEvent(), keyword="猫")))
+    sending = payload(run(bot.sticker_send(FakeEvent(), keyword="猫")))
+    assert listing["error"]["code"] == "disabled", listing
+    assert sending["error"]["code"] == "disabled", sending
