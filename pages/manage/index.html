@@ -53,6 +53,14 @@
     <button id="btnSaveConfig">保存配置</button>
   </div>
   <div class="muted" style="margin-top:8px">添加/移除管理员会自动保存并立即生效；存储上限修改后点“保存配置”。</div>
+  <div class="row" style="margin-top:12px; align-items:center">
+    <span class="muted">图库用量</span>
+    <div style="flex:1; min-width:180px; height:10px; background:rgba(128,128,128,.2); border-radius:6px; overflow:hidden">
+      <div id="usageFill" style="height:100%; width:0%; background:#22c55e; transition:width .3s"></div>
+    </div>
+    <strong id="usageText">-</strong>
+  </div>
+  <div class="muted" id="usageHint"></div>
 </div>
 
 <div class="card">
@@ -94,6 +102,7 @@
     <span class="muted">完整备份有 600MB 级，网络不稳时建议按关键词导出</span>
   </div>
   <div class="muted" style="margin-bottom:10px">恢复为合并式：重叠图片按 MD5 自动跳过；结果显示新增 / 覆盖 / 跳过 / 失败数量。</div>
+  <div class="muted" style="margin-bottom:10px">⚠️ 恢复<b>不受存储上限约束</b>：恢复一个超过剩余额度的大包后，图库会超限，之后新增图片会被拒绝。恢复前请留意上方「图库用量」，必要时先调高上限或清理。</div>
   <table>
     <thead><tr><th>备份文件</th><th>大小</th><th>创建时间</th><th>操作</th></tr></thead>
     <tbody id="backupBody"></tbody>
@@ -126,9 +135,11 @@
   }
 
   function fmtSize(bytes) {
-    if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + ' MB';
-    if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
-    return bytes + ' B';
+    const n = Number(bytes) || 0;
+    if (n >= 1024 * 1024 * 1024) return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+    if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(2) + ' MB';
+    if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+    return n + ' B';
   }
 
   function renderAdmins() {
@@ -189,6 +200,7 @@
       document.getElementById('backupKeepInput').value = (r && r.backup_keep) || 2;
       document.getElementById('backupTotalInput').value = (r && r.backup_total_mb) || 1024;
       document.getElementById('maxImageInput').value = (r && typeof r.max_image_mb === 'number') ? r.max_image_mb : 10;
+      renderUsage(r && r.storage);
       const ai = (r && r.ai) || {};
       const pickAi = (key, fallback) => (ai[key] === undefined || ai[key] === null ? fallback : ai[key]);
       document.getElementById('aiToolsOn').checked = pickAi('sticker_ai_tools_enabled', true) !== false;
@@ -200,6 +212,33 @@
       renderAdmins();
     } catch (e) {
       show('加载配置失败：' + (e && e.message ? e.message : e), true);
+    }
+  }
+
+  function renderUsage(storage) {
+    const usage = storage || {};
+    const used = Number(usage.used_mb || 0);
+    const limit = Number(usage.limit_mb || 0);
+    const backups = Number(usage.backup_mb || 0);
+    const files = Number(usage.files || 0);
+    const pct = limit > 0 ? Math.min(100, (used / limit) * 100) : 0;
+    document.getElementById('usageText').textContent =
+      used.toFixed(1) + ' / ' + (limit > 0 ? limit : '不限') + ' MB' +
+      (limit > 0 ? '（' + pct.toFixed(1) + '%）' : '') +
+      '，共 ' + files + ' 张；备份另占 ' + backups.toFixed(1) + ' MB / ' + Number(usage.backup_count || 0) + ' 份';
+    const fill = document.getElementById('usageFill');
+    fill.style.width = (limit > 0 ? pct : 0) + '%';
+    fill.style.background = (limit > 0 && used >= limit) ? '#dc2626' : (pct >= 80 ? '#f59e0b' : '#22c55e');
+    const hint = document.getElementById('usageHint');
+    if (limit > 0 && used >= limit) {
+      hint.style.color = '#dc2626';
+      hint.textContent = '⚠️ 已超过上限：新增图片会被拒绝。请先删除部分关键词，或调高「存储上限」。';
+    } else if (pct >= 80) {
+      hint.style.color = '#f59e0b';
+      hint.textContent = '⚠️ 已用超过 80%，接近上限。备份文件不计入上限，但会占用磁盘。';
+    } else {
+      hint.style.color = '';
+      hint.textContent = '备份文件不计入存储上限（上限只管图库），但会占用磁盘空间。';
     }
   }
 
