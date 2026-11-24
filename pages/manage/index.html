@@ -44,6 +44,12 @@
   <div class="row" style="margin-top:14px">
     <label>存储上限（MB）</label>
     <input type="number" id="mbInput" min="1">
+  </div>
+  <div class="row" style="margin-bottom:6px">
+    <label>自动备份保留份数</label>
+    <input type="number" id="backupKeepInput" min="1" max="20">
+    <label>备份总量上限（MB）</label>
+    <input type="number" id="backupTotalInput" min="100" max="20000">
     <button id="btnSaveConfig">保存配置</button>
   </div>
   <div class="muted" style="margin-top:8px">添加/移除管理员会自动保存并立即生效；存储上限修改后点“保存配置”。</div>
@@ -137,7 +143,9 @@
         renderAdmins();
         try {
           const mb = Number(document.getElementById('mbInput').value) || maxStorageMb;
-          await A.apiPost('config', { admin_users: adminUsers, max_storage_mb: mb });
+      const keep = Number(document.getElementById('backupKeepInput').value) || 2;
+      const totalMb = Number(document.getElementById('backupTotalInput').value) || 1024;
+          await A.apiPost('config', { admin_users: adminUsers, max_storage_mb: mb, backup_keep: keep, backup_total_mb: totalMb });
           show('管理员已移除并保存');
         } catch (e) {
           show('保存失败：' + (e && e.message ? e.message : e), true);
@@ -171,6 +179,8 @@
       adminUsers = (r && Array.isArray(r.admin_users) ? r.admin_users : []).slice();
       maxStorageMb = (r && r.max_storage_mb) || 200;
       document.getElementById('mbInput').value = maxStorageMb;
+      document.getElementById('backupKeepInput').value = (r && r.backup_keep) || 2;
+      document.getElementById('backupTotalInput').value = (r && r.backup_total_mb) || 1024;
       const ai = (r && r.ai) || {};
       const pickAi = (key, fallback) => (ai[key] === undefined || ai[key] === null ? fallback : ai[key]);
       document.getElementById('aiToolsOn').checked = pickAi('sticker_ai_tools_enabled', true) !== false;
@@ -256,6 +266,8 @@
       input.value = '';
       renderAdmins();
       const mb = Number(document.getElementById('mbInput').value);
+      const keep = Number(document.getElementById('backupKeepInput').value) || 2;
+      const totalMb = Number(document.getElementById('backupTotalInput').value) || 1024;
       const ai = {
         sticker_ai_tools_enabled: document.getElementById('aiToolsOn').checked,
         sticker_ai_read_enabled: document.getElementById('aiReadOn').checked,
@@ -264,7 +276,7 @@
         sticker_ai_throttle_window: Number(document.getElementById('aiThrottleWindow').value),
         sticker_ai_send_dedup_window: Number(document.getElementById('aiSendDedup').value),
       };
-      const r = await A.apiPost('config', { admin_users: adminUsers, max_storage_mb: mb, ai: ai });
+      const r = await A.apiPost('config', { admin_users: adminUsers, max_storage_mb: mb, backup_keep: keep, backup_total_mb: totalMb, ai: ai });
       show('配置已保存并生效');
       await loadConfig();
     } catch (e) {
