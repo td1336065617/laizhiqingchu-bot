@@ -1,0 +1,231 @@
+"""SQLite 存储层（P1）。
+
+设计取舍：内存里的 `self.index` 仍然是读取的唯一入口（32 处消费点不动），
+DB 承担三件事：
+1. **原子持久化**：WAL + 事务替代 write_text 全量重写；
+2. **MD5 索引**：按关键词查 MD5，替代"遍历目录逐文件算"（冷启动也不再全盘扫）；
+3. **关系数据**：别名组、管理员、审计（P2 用）。
+
+JSON 镜像继续写（`index.json`），保证旧版可恢复、备份格式不变。
+`STICKER_STORAGE=json` 时整个模块不启用，行为回到 1.4.1。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+SCHEMA_VERSION = 1
+
+DDL = """
+CREATE TABLE IF NOT EXISTS meta (
+    k TEXT PRIMARY KEY,
+    v TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS keyword (
+    k TEXT PRIMARY KEY,
+    blocked INTEGER NOT NULL DEFAULT 0,
+    created_at REAL
+);
+CREATE TABLE IF NOT EXISTS image (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kw TEXT NOT NULL REFERENCES keyword(k) ON DELETE CASCADE,
+    filename TEXT NOT NULL,
+    md5 TEXT,
+    ext TEXT,
+    bytes INTEGER,
+    created_at REAL,
+    UNIQUE(kw, filename)
+);
+CREATE INDEX IF NOT EXISTS ix_image_kw ON image(kw, id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_image_md5 ON image(kw, md5) WHERE md5 IS NOT NULL;
+CREATE TABLE IF NOT EXISTS alias_group (
+    primary_kw TEXT PRIMARY KEY REFERENCES keyword(k) ON DELETE CASCADE,
+    created_at REAL
+);
+CREATE TABLE IF NOT EXISTS alias (
+    alias TEXT PRIMARY KEY,
+    primary_kw TEXT NOT NULL REFERENCES alias_group(primary_kw) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS admin (
+    platform_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    created_at REAL,
+    granted_by TEXT,
+    PRIMARY KEY (platform_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS admin_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    action TEXT NOT NULL,
+    actor TEXT,
+    target TEXT,
+    result TEXT
+);
+"""
+
+
+def storage_mode() -> str:
+    """存储模式：sqlite（默认）或 json（回滚开关）。"""
+    value = (os.environ.get("STICKER_STORAGE") or "").strip().lower()
+    return "json" if value == "json" else "sqlite"
+
+
+class Store:
+    """薄封装：只做 SQL，不含业务判断。"""
+
+    def __init__(self, db_path: Path):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.db_path), timeout=5.0)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.executescript(DDL)
+        self.conn.commit()
+        self.conn.execute(
+            "INSERT OR IGNORE INTO meta(k, v) VALUES(?, ?)", ("schema_version", str(SCHEMA_VERSION))
+        )
+        self.conn.commit()
+
+    # ---- 基础 ----
+    def schema_version(self) -> int:
+        row = self.conn.execute("SELECT v FROM meta WHERE k=?", ("schema_version",)).fetchone()
+        try:
+            return int(row["v"]) if row else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except sqlite3.Error:
+            pass
+
+    def counts(self) -> Dict[str, int]:
+        keywords = self.conn.execute("SELECT COUNT(*) AS c FROM keyword").fetchone()["c"]
+        images = self.conn.execute("SELECT COUNT(*) AS c FROM image").fetchone()["c"]
+        return {"keywords": int(keywords), "images": int(images)}
+
+    def integrity(self) -> str:
+        row = self.conn.execute("PRAGMA integrity_check").fetchone()
+        return str(row[0]) if row else "unknown"
+
+    # ---- 索引读写 ----
+    def load_index(self) -> Dict[str, List[str]]:
+        index: Dict[str, List[str]] = {}
+        for row in self.conn.execute(
+            "SELECT kw, filename FROM image ORDER BY kw, id"
+        ):
+            index.setdefault(row["kw"], []).append(row["filename"])
+        return index
+
+    def sync_index(self, index: Dict[str, List[str]], md5_of=None) -> None:
+        """把内存索引整体写进库（单事务）。
+
+        md5_of: 可选的 `callable(kw, filename) -> (md5, bytes, ext)`，用于补全 MD5 列。
+        数据量级（线上 2268 行）全量重写是毫秒级，比做 diff 更简单可靠。
+        """
+        with self.conn:
+            self.conn.execute("DELETE FROM image")
+            self.conn.execute("DELETE FROM keyword")
+            for kw, names in index.items():
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO keyword(k, blocked, created_at) VALUES(?, 0, ?)",
+                    (kw, 0),
+                )
+                for filename in names:
+                    md5 = ext = None
+                    size = None
+                    if md5_of is not None:
+                        try:
+                            md5, size, ext = md5_of(kw, filename)
+                        except Exception:
+                            md5 = ext = size = None
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO image(kw, filename, md5, ext, bytes, created_at) "
+                        "VALUES(?, ?, ?, ?, ?, ?)",
+                        (kw, filename, md5, ext, size, 0),
+                    )
+
+    def md5s_of(self, keyword: str) -> Dict[str, str]:
+        rows = self.conn.execute(
+            "SELECT filename, md5 FROM image WHERE kw=? AND md5 IS NOT NULL", (keyword,)
+        )
+        return {row["filename"]: row["md5"] for row in rows}
+
+    def set_md5(self, keyword: str, filename: str, md5: str, size: Optional[int], ext: Optional[str]) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE image SET md5=?, bytes=?, ext=? WHERE kw=? AND filename=?",
+                (md5, size, ext, keyword, filename),
+            )
+
+    def set_md5s(self, keyword: str, mapping: Dict[str, str]) -> None:
+        """批量补 MD5（避免逐条事务）。"""
+        if not mapping:
+            return
+        with self.conn:
+            for filename, digest in mapping.items():
+                self.conn.execute(
+                    "UPDATE image SET md5=? WHERE kw=? AND filename=?",
+                    (digest, keyword, filename),
+                )
+
+    def delete_by_md5(self, md5s: Iterable[str], keyword: Optional[str] = None) -> List[Tuple[str, str]]:
+        wanted = [m for m in md5s if m]
+        if not wanted:
+            return []
+        placeholders = ",".join("?" for _ in wanted)
+        if keyword:
+            rows = self.conn.execute(
+                f"SELECT kw, filename FROM image WHERE md5 IN ({placeholders}) AND kw=?",
+                (*wanted, keyword),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                f"SELECT kw, filename FROM image WHERE md5 IN ({placeholders})",
+                tuple(wanted),
+            ).fetchall()
+        return [(row["kw"], row["filename"]) for row in rows]
+
+    def remove_files(self, pairs: Iterable[Tuple[str, str]]) -> None:
+        with self.conn:
+            for kw, filename in pairs:
+                self.conn.execute("DELETE FROM image WHERE kw=? AND filename=?", (kw, filename))
+
+    def clear_content(self) -> None:
+        """清空贴纸内容，但保留 meta / admin / admin_audit。"""
+        with self.conn:
+            self.conn.execute("DELETE FROM image")
+            self.conn.execute("DELETE FROM keyword")
+            self.conn.execute("DELETE FROM alias")
+            self.conn.execute("DELETE FROM alias_group")
+
+    def prune_keyword(self, keyword: str, keep: Iterable[str]) -> None:
+        keep_set = set(keep)
+        with self.conn:
+            for row in self.conn.execute(
+                "SELECT filename FROM image WHERE kw=?", (keyword,)
+            ).fetchall():
+                if row["filename"] not in keep_set:
+                    self.conn.execute(
+                        "DELETE FROM image WHERE kw=? AND filename=?", (keyword, row["filename"])
+                    )
+
+    # ---- 迁移 ----
+    def migrate(self, index: Dict[str, List[str]], md5_of=None) -> Dict[str, int]:
+        """幂等迁移：已有数据时只补差，返回值用于和 JSON 对账。"""
+        if self.schema_version() < SCHEMA_VERSION:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO meta(k, v) VALUES(?, ?)",
+                    ("schema_version", str(SCHEMA_VERSION)),
+                )
+        self.sync_index(index, md5_of)
+        return self.counts()

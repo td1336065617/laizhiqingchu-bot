@@ -37,6 +37,11 @@ from astrbot.api.message_components import Image, Reply
 from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, file_response, json_response, request
 
+try:  # 同目录模块：包内导入时用相对导入，脚本/测试直跑时回落到绝对导入
+    from . import sticker_store as _store_mod
+except ImportError:  # pragma: no cover
+    import sticker_store as _store_mod
+
 from . import platform_compat
 from .menu_renderer import StickerMenuRenderer
 
@@ -225,7 +230,10 @@ class StickerPlugin(Star):
         # AI 工具：节流器 + 发送幂等记录（同会话同关键词窗口内不重复发图）
         self._ai_throttle = None
         self._ai_send_log: dict = {}
+        self._store = None
+        # 顺序要紧：先读 JSON（迁移源），再决定用 SQLite 还是继续纯 JSON
         self._load_index()
+        self._init_storage()
         self._load_blocked()
         self._check_storage()
         logger.info(
@@ -1605,7 +1613,7 @@ class StickerPlugin(Star):
                 "manifest.json",
                 json.dumps(
                     {
-                        "version": 1,
+                        "version": 2,
                         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                         "keywords": len(payload_index),
                         "only_keyword": only_keyword,
@@ -1739,7 +1747,7 @@ class StickerPlugin(Star):
             if "index.json" not in members or "manifest.json" not in members:
                 raise ValueError("压缩包格式不正确：缺少 index.json 或 manifest.json")
             manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
-            if manifest.get("version") != 1:
+            if manifest.get("version") not in (1, 2):
                 raise ValueError("不支持的备份版本")
             archive_index = json.loads(zf.read("index.json").decode("utf-8"))
             if not isinstance(archive_index, dict):
@@ -1770,9 +1778,17 @@ class StickerPlugin(Star):
                     f"数据校验失败：manifest 记录 {manifest.get('keywords')} 个关键词，"
                     f"实际索引 {len(archive_index)} 个"
                 )
-            # 包内文件必须是索引引用的图片或固定元数据文件，且路径安全
+            # 顺序硬约束：先把合法的单段元数据文件放行，再校验其余成员路径。
+            # 反过来的话 v2 包会被判成"包含未索引的文件"直接抛错。
+            meta_members = (
+                "index.json",
+                "manifest.json",
+                "blocked_keywords.json",
+                "aliases.json",
+                "admin.json",
+            )
             for member in members:
-                if member in ("index.json", "manifest.json", "blocked_keywords.json"):
+                if member in meta_members:
                     continue
                 parts = Path(member).parts
                 if len(parts) != 2 or ".." in parts or parts[0] in (".", ".."):
@@ -2103,6 +2119,7 @@ class StickerPlugin(Star):
         folder = self.data_dir / keyword
         cache = self.__dict__.setdefault("_md5_cache", {})
         cached = cache.setdefault(keyword, {})
+        store = self.__dict__.get("_store")
         current = {}
         try:
             for entry in folder.iterdir():
@@ -2114,6 +2131,17 @@ class StickerPlugin(Star):
                     current[entry.name] = (stat.st_size, stat.st_mtime_ns)
         except OSError:
             current = {}
+
+        if not cached and store is not None:
+            # 冷启动用库里的 MD5 做种子：否则首次添加仍要把整个目录重算一遍。
+            # 种子必须带上真实 (size, mtime_ns)，否则会被下面的校验判为失效又重算。
+            try:
+                for name, digest in store.md5s_of(keyword).items():
+                    if name in current:
+                        size, mtime_ns = current[name]
+                        cached[name] = (digest, size, mtime_ns)
+            except Exception as exc:
+                logger.warning("读取 SQLite MD5 失败（将重算）：%s", exc)
 
         result = {}
         for name, (size, mtime_ns) in current.items():
@@ -2131,6 +2159,11 @@ class StickerPlugin(Star):
 
         for stale in [name for name in cached if name not in current]:
             cached.pop(stale, None)
+        if store is not None:
+            try:
+                store.set_md5s(keyword, result)
+            except Exception as exc:
+                logger.warning("回写 SQLite MD5 失败：%s", exc)
         return result
 
     def _remember_md5(self, keyword: str, filename: str, digest: str) -> None:
@@ -2143,6 +2176,77 @@ class StickerPlugin(Star):
             cached.pop(filename, None)
             return
         cached[filename] = (digest, stat.st_size, stat.st_mtime_ns)
+
+    @property
+    def db_path(self) -> Path:
+        """惰性路径：测试里直接改 data_dir 时不会写到真实目录。"""
+        return self.data_dir / "index.db"
+
+    def _md5_for_sync(self, keyword: str, filename: str):
+        """给 Store.sync_index 用的增量 MD5 提供器：缓存里没有就返回 None（列留空后续补）。"""
+        cache = self.__dict__.get("_md5_cache") or {}
+        hit = (cache.get(keyword) or {}).get(filename)
+        if not hit:
+            return None, None, None
+        digest = hit[0] if isinstance(hit, tuple) else hit
+        try:
+            stat_info = (self.data_dir / keyword / filename).stat()
+            return digest, stat_info.st_size, Path(filename).suffix.lower()
+        except OSError:
+            return digest, None, Path(filename).suffix.lower()
+
+    def _init_storage(self) -> None:
+        """建立 SQLite 存储（失败或 STICKER_STORAGE=json 时保持纯 JSON）。"""
+        if _store_mod.storage_mode() == "json":
+            logger.info("存储模式：json（STICKER_STORAGE=json，不启用 SQLite）")
+            return
+        try:
+            store = _store_mod.Store(self.db_path)
+        except Exception as exc:
+            logger.error("打开 SQLite 失败，回落纯 JSON：%s", exc)
+            return
+        self._store = store
+        try:
+            counts = store.counts()
+            if counts["images"] == 0:
+                # 库空：把 JSON 索引迁移进来（幂等，迁移前先留一份 .bak）
+                index_file = self.data_dir / "index.json"
+                if index_file.exists():
+                    try:
+                        backup = index_file.with_suffix(".json.bak")
+                        if not backup.exists():
+                            backup.write_bytes(index_file.read_bytes())
+                    except OSError:
+                        pass
+                expected = sum(len(v) for v in self.index.values())
+                migrated = store.migrate(self.index, self._md5_for_sync)
+                if migrated["images"] != expected:
+                    raise RuntimeError(
+                        f"迁移校验失败：JSON {expected} 张 vs DB {migrated['images']} 张"
+                    )
+                logger.info(
+                    "迁移完成并校验通过：%d 关键词 / %d 张",
+                    migrated["keywords"],
+                    migrated["images"],
+                )
+            else:
+                loaded = store.load_index()
+                if loaded:
+                    self.index = loaded
+                    logger.info(
+                        "索引已从 SQLite 载入：%d 关键词 / %d 张",
+                        len(loaded),
+                        sum(len(v) for v in loaded.values()),
+                    )
+        except Exception as exc:
+            logger.error("SQLite 初始化失败，回落纯 JSON：%s", exc)
+            try:
+                store.close()
+            except Exception:
+                pass
+            self._store = None
+            # DB 载入可能已覆盖过内存索引：回落时以 JSON 为准重新读一次
+            self._load_index()
 
     def _load_index(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -2179,10 +2283,17 @@ class StickerPlugin(Star):
             logger.error("保存屏蔽列表失败: %s", exc)
 
     def _save_index(self):
+        # JSON 镜像始终写：旧版本可读、备份格式不变、DB 故障时仍能降级
         try:
             _atomic_write_json(self.index_path, self.index)
         except OSError as exc:
             logger.error("保存索引失败: %s", exc)
+        store = self.__dict__.get("_store")
+        if store is not None:
+            try:
+                store.sync_index(self.index, self._md5_for_sync)
+            except Exception as exc:
+                logger.error("写入 SQLite 失败（JSON 镜像仍有效）: %s", exc)
 
     def _check_storage(self):
         """启动时检查一次并告警（真正的拦截在 _enforce_storage，每次新增前调用）。"""
