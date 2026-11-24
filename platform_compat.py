@@ -63,6 +63,14 @@ def admin_entry_matches(entry: str, platform_id: str, user_id: str) -> bool:
     return entry == str(user_id or "")
 
 
+def message_components(event) -> list:
+    """消息链组件（供取 At / Reply 用）；取不到时返回空列表，不抛异常。"""
+    try:
+        return _message_chain(event)
+    except Exception:
+        return []
+
+
 def _message_chain(event) -> list:
     message_obj = getattr(event, "message_obj", None)
     return list(getattr(message_obj, "message", None) or [])

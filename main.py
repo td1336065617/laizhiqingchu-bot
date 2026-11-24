@@ -70,8 +70,15 @@ RESERVED_KEYWORDS = {
     "绑定",
     "解绑",
     "别名",
+    "授予管理员",
+    "撤销管理员",
+    "管理员列表",
 }
 # 二次删除确认的有效期（秒）
+# 平台占位 ID：官方适配器在取不到真实 id 时会塞这些值（不可当管理员）
+ADMIN_ID_PLACEHOLDERS = {"", "all", "qq_official", "unknown_selfid"}
+# 正文里的 @ 记号（官方通道 @他人不产生 At 组件，只留字面量）
+AT_ID_RE = re.compile(r"<@!?([A-Za-z0-9_-]{6,})>")
 CONFIRM_TTL = 60
 # “先发添加指令、再发合并转发”模式的等待有效期（秒）
 FORWARD_ADD_TTL = 90
@@ -395,6 +402,15 @@ class StickerPlugin(Star):
                     yield result
             elif message_str.startswith("表情包管理菜单"):
                 async for result in self._handle_menu(event, message_str):
+                    yield result
+            elif message_str.startswith("授予管理员"):
+                async for result in self._handle_grant_admin(event, message_str):
+                    yield result
+            elif message_str.startswith("撤销管理员"):
+                async for result in self._handle_revoke_admin(event, message_str):
+                    yield result
+            elif message_str.startswith("管理员列表"):
+                async for result in self._handle_admin_list(event):
                     yield result
             elif message_str.startswith("绑定"):
                 async for result in self._handle_bind(event, message_str):
@@ -1974,6 +1990,210 @@ class StickerPlugin(Star):
     # ------------------------------------------------------------------
     # H. 屏蔽关键词（仅管理员）
     # ------------------------------------------------------------------
+    # ---------------- 管理员授予 ----------------
+    def _admin_entries(self) -> list:
+        return [
+            str(a).strip()
+            for a in (self.config.get("admin_users", []) or [])
+            if str(a).strip()
+        ]
+
+    def _extract_admin_targets(self, event) -> list:
+        """三路兜底取目标 ID：消息链 At → 正文 <@id> → 引用消息发送者。
+
+        官方通道 @他人不产生 At 组件（只留字面量），所以正文正则不是可选项。
+        """
+        found: list = []
+        self_id = ""
+        try:
+            self_id = str(event.get_self_id() or "")
+        except Exception:
+            self_id = ""
+
+        def _push(value) -> None:
+            text = str(value or "").strip()
+            if not text or text in ADMIN_ID_PLACEHOLDERS:
+                return
+            if self_id and text == self_id:
+                return
+            if text not in found:
+                found.append(text)
+
+        for component in platform_compat.message_components(event):
+            if type(component).__name__ == "At":
+                _push(getattr(component, "qq", None))
+
+        raw_text = ""
+        try:
+            raw_text = str(event.message_str or "")
+        except Exception:
+            raw_text = ""
+        for match in AT_ID_RE.finditer(raw_text):
+            _push(match.group(1))
+
+        try:
+            reply = getattr(getattr(event, "message_obj", None), "message", None) or []
+        except Exception:
+            reply = []
+        for component in reply:
+            if type(component).__name__ == "Reply":
+                _push(getattr(component, "sender_id", None))
+
+        return found
+
+    def _audit_admin(self, action: str, actor: str, target: str, result: str) -> None:
+        """管理员变更留痕（jsonl，一行一条；写失败只警告不阻断）。"""
+        line = json.dumps(
+            {
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "action": action,
+                "actor": actor,
+                "target": target,
+                "result": result,
+            },
+            ensure_ascii=False,
+        )
+        try:
+            path = self.data_dir / "admin_audit.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError as exc:
+            logger.warning("写入管理员审计失败: %s", exc)
+
+    def _write_admins(self, entries: list, *, actor: str, action: str, target: str) -> None:
+        self.config["admin_users"] = entries
+        self.config.save_config()
+        self._audit_admin(action, actor, target, "ok")
+
+    def _mask_id(self, value: str) -> str:
+        text = str(value or "")
+        if len(text) <= 8:
+            return text
+        return f"{text[:4]}…{text[-4:]}"
+
+    async def _handle_grant_admin(self, event: AstrMessageEvent, message_str: str):
+        admins = self._admin_entries()
+        actor = str(event.get_sender_id() or "")
+        if not admins:
+            # 决策 A：首个管理员只能来自 WebUI，避免"谁先说谁是管理员"
+            yield event.plain_result(
+                "当前还没有管理员：请先在 AstrBot WebUI 的「表情包管理」页配置管理员，"
+                "之后才能用本指令授予他人"
+            )
+            self._audit_admin("grant", actor, "-", "no-admin-bootstrap")
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("此指令仅限管理员")
+            self._audit_admin("grant", actor, "-", "denied")
+            return
+
+        raw = message_str[len("授予管理员") :].strip()
+        targets = self._extract_admin_targets(event)
+        if raw:
+            targets.append(raw)
+        targets = [t for t in dict.fromkeys(targets) if t not in ADMIN_ID_PLACEHOLDERS]
+        if not targets:
+            yield event.plain_result(
+                "用法：@某人 后发「授予管理员」，或直接发「授予管理员{ID}」"
+            )
+            return
+
+        platform_id = str(event.get_platform_id() or "")
+        added, existed = [], []
+        entries = list(admins)
+        for target in targets:
+            entry = platform_compat.scoped_key(platform_id, target)
+            if any(
+                platform_compat.admin_entry_matches(existing, platform_id, target)
+                for existing in entries
+            ):
+                existed.append(target)
+                continue
+            entries.append(entry)
+            added.append(entry)
+        if added:
+            try:
+                self._write_admins(entries, actor=actor, action="grant", target=",".join(added))
+            except Exception as exc:
+                logger.error("保存管理员失败: %s", exc)
+                yield event.plain_result(f"保存失败：{exc}")
+                return
+        parts = []
+        if added:
+            parts.append(f"已授予 {len(added)} 人管理员：" + "、".join(self._mask_id(x) for x in added))
+        if existed:
+            parts.append("已是管理员：" + "、".join(self._mask_id(x) for x in existed))
+        yield event.plain_result("；".join(parts) or "没有变化")
+
+    async def _handle_revoke_admin(self, event: AstrMessageEvent, message_str: str):
+        admins = self._admin_entries()
+        actor = str(event.get_sender_id() or "")
+        if not admins:
+            yield event.plain_result(
+                "当前还没有管理员：请先在 AstrBot WebUI 的「表情包管理」页配置管理员"
+            )
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("此指令仅限管理员")
+            self._audit_admin("revoke", actor, "-", "denied")
+            return
+
+        raw = message_str[len("撤销管理员") :].strip()
+        targets = self._extract_admin_targets(event)
+        if raw:
+            targets.append(raw)
+        targets = [t for t in dict.fromkeys(targets) if t not in ADMIN_ID_PLACEHOLDERS]
+        if not targets:
+            yield event.plain_result(
+                "用法：@某人 后发「撤销管理员」，或直接发「撤销管理员{ID}」"
+            )
+            return
+
+        platform_id = str(event.get_platform_id() or "")
+        entries = list(admins)
+        removed = []
+        for target in targets:
+            keep = [
+                entry
+                for entry in entries
+                if not platform_compat.admin_entry_matches(entry, platform_id, target)
+            ]
+            if len(keep) == len(entries):
+                continue
+            if not keep:
+                yield event.plain_result("不能撤销最后一个管理员（否则没人能再管理）")
+                self._audit_admin("revoke", actor, target, "last-admin")
+                return
+            entries = keep
+            removed.append(target)
+        if not removed:
+            yield event.plain_result("目标不是管理员")
+            return
+        try:
+            self._write_admins(entries, actor=actor, action="revoke", target=",".join(removed))
+        except Exception as exc:
+            logger.error("保存管理员失败: %s", exc)
+            yield event.plain_result(f"保存失败：{exc}")
+            return
+        yield event.plain_result(f"已撤销 {len(removed)} 人管理员权限")
+
+    async def _handle_admin_list(self, event: AstrMessageEvent):
+        admins = self._admin_entries()
+        if not admins:
+            yield event.plain_result(
+                "当前还没有管理员：请先在 AstrBot WebUI 的「表情包管理」页配置"
+            )
+            return
+        lines = [f"管理员（{len(admins)}）："]
+        for entry in admins:
+            if ":" in entry:
+                pid, uid = entry.split(":", 1)
+                lines.append(f"- {self._mask_id(uid)}（平台 {pid}）")
+            else:
+                lines.append(f"- {self._mask_id(entry)}（全平台）")
+        yield event.plain_result("\n".join(lines))
+
     # ---------------- 别名组指令 ----------------
     async def _handle_bind(self, event: AstrMessageEvent, message_str: str):
         """绑定{别名}到{主词}：单层多对一，别名不得当组名。"""
