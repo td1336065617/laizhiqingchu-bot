@@ -438,8 +438,7 @@ class StickerPlugin(Star):
             )
             return
 
-        added, skipped, failed = await self._add_images(keyword, images)
-        blocked = self.__dict__.pop("_last_storage_blocked", None)
+        added, skipped, failed, blocked = await self._add_images(keyword, images)
         if blocked:
             yield event.plain_result(f"添加失败：{blocked}")
             return
@@ -474,15 +473,17 @@ class StickerPlugin(Star):
 
     async def _add_images(
         self, keyword: str, images: List[Image]
-    ) -> Tuple[int, int, int]:
-        """把图片批量写入关键词目录（MD5 去重），返回 (新增, 跳过重复, 下载失败)。"""
-        self.__dict__.pop("_last_storage_blocked", None)
+    ) -> Tuple[int, int, int, Optional[str]]:
+        """把图片批量写入关键词目录（MD5 去重）。
+
+        返回 (新增, 跳过重复, 下载失败, 拒绝原因)。拒绝原因随返回值走，
+        不用实例变量：实例变量在并发请求下会串味（审计 M2）。
+        """
         reason = self._enforce_storage()
         if reason:
             # 拒绝写入：不建目录、不落盘、不动索引
-            self._last_storage_blocked = reason
             logger.warning("拒绝添加图片（%s）：%s", keyword, reason)
-            return 0, 0, 0
+            return 0, 0, 0, reason
 
         folder = self.data_dir / keyword
         folder.mkdir(parents=True, exist_ok=True)
@@ -534,7 +535,7 @@ class StickerPlugin(Star):
             added += 1
 
         self._save_index()
-        return added, skipped, failed
+        return added, skipped, failed, None
 
     # ------------------------------------------------------------------
     # B. 发送（来只{关键词}）
@@ -1293,6 +1294,22 @@ class StickerPlugin(Star):
             logger.error("备份失败: %s", exc, exc_info=True)
             progress.update({"state": "failed", "error": str(exc)})
 
+    def _on_backup_task_done(self, task) -> None:
+        """后台任务收尾：异常必须落到 state，否则前端会永远停在"备份中"。"""
+        state = self.__dict__.get("_backup_state") or {}
+        try:
+            exc = None if task.cancelled() else task.exception()
+        except Exception:  # pragma: no cover - 取异常本身失败
+            exc = None
+        if state.get("state") == "running" and (task.cancelled() or exc is not None):
+            state.update(
+                {
+                    "state": "failed",
+                    "error": "任务被取消" if task.cancelled() else str(exc),
+                }
+            )
+            logger.error("备份任务异常结束: %s", state.get("error"))
+
     async def _web_backup(self):
         """受理备份请求：后台线程执行，立刻返回，避免把事件循环卡住。
 
@@ -1317,7 +1334,7 @@ class StickerPlugin(Star):
         task = asyncio.create_task(asyncio.to_thread(self._run_backup_thread, progress))
         # 必须持引用：不持引用时 task 可能被 GC，异常也会丢
         self._backup_task = task
-        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        task.add_done_callback(self._on_backup_task_done)
         return json_response(
             {
                 "status": "accepted",
@@ -1326,21 +1343,6 @@ class StickerPlugin(Star):
                     "可在备份列表查看进度"
                 ),
                 "data": progress,
-            }
-        )
-        return json_response(
-            {
-                "status": "success",
-                "data": {
-                    "filename": info["filename"],
-                    "keywords": info["keywords"],
-                    "images": info["images"],
-                    "size": info["size"],
-                    "message": (
-                        f"备份完成：{info['keywords']} 个关键词，"
-                        f"{info['images']} 张图片，{info['size'] / 1024:.1f} KB"
-                    ),
-                },
             }
         )
 
@@ -1384,7 +1386,10 @@ class StickerPlugin(Star):
         if state.get("state") == "running":
             return error_response("备份进行中，请稍后再导出")
         try:
-            info = self._backup_to_zip(prefix="export", only_keyword=keyword)
+            # 走线程：导出可能上百 MB，在协程里同步压缩会堵住事件循环（审计 M1）
+            info = await asyncio.to_thread(
+                self._backup_to_zip, "export", None, keyword
+            )
         except Exception as exc:
             logger.error("导出关键词失败: %s", exc, exc_info=True)
             return error_response(f"导出失败：{exc}")
@@ -1460,7 +1465,7 @@ class StickerPlugin(Star):
             await upload.save(tmp_path)
             # 恢复是不可逆操作：先留一份快照，快照失败就中止（宁可不恢复）
             try:
-                pre = self._backup_to_zip(prefix="pre-restore")
+                pre = await asyncio.to_thread(self._backup_to_zip, "pre-restore")
                 logger.info(
                     "恢复前已自动备份：%s（%.1fMB）",
                     pre["filename"],
@@ -1522,20 +1527,46 @@ class StickerPlugin(Star):
         """把当前全部表情包数据打包为 zip（含 manifest 校验清单）。
 
         prefix 用于区分自动备份（sticker_backup_*）与恢复前快照（pre-restore_*）。
-        用 ZIP_STORED：图片本身已压缩，实测压缩比 0.96，DEFLATE 只烧 CPU（637MB 约 15s → 约 1.5s）。
+        用 ZIP_STORED：图片本身已压缩，实测压缩比 0.96，DEFLATE 只烧 CPU（637MB 约 15s → 约 1.3s）。
         """
         self.backup_root.mkdir(parents=True, exist_ok=True)
         filename = (
             f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}_{random.randint(1000, 9999)}.zip"
         )
         target = self.backup_root / filename
+        # 立刻快照索引：备份期间有新图入库时，直接遍历活字典会抛
+        # RuntimeError: dictionary changed size during iteration（审计 S1）。
+        if only_keyword and only_keyword in self.index:
+            payload_index = {only_keyword: list(self.index[only_keyword])}
+        else:
+            payload_index = {k: list(v) for k, v in self.index.items()}
+        # 先写 .part，成功后原子改名：中途失败不会留下能被列表/下载/用量统计
+        # 当有效包的半截 zip（审计 S3）。
+        part = target.with_suffix(target.suffix + ".part")
+        try:
+            info = self._write_backup_zip(part, payload_index, progress, only_keyword)
+            os.replace(part, target)
+        except BaseException:
+            try:
+                if part.exists():
+                    part.unlink()
+            except OSError:
+                pass
+            raise
+        info["filename"] = filename
+        info["size"] = target.stat().st_size
+        info["pruned"] = self._prune_backups(keep_name=filename)
+        return info
+
+    def _write_backup_zip(
+        self,
+        target: Path,
+        payload_index: dict,
+        progress: Optional[dict],
+        only_keyword: Optional[str],
+    ) -> dict:
+        """把 payload_index 写进 target（调用方负责 .part + 原子改名）。"""
         files_meta = []
-        # 只导某个关键词时，索引也只带这一条：产物仍是标准备份包，可直接恢复
-        payload_index = (
-            {only_keyword: self.index[only_keyword]}
-            if only_keyword and only_keyword in self.index
-            else self.index
-        )
         with zipfile.ZipFile(target, "w", zipfile.ZIP_STORED) as zf:
             zf.writestr(
                 "index.json",
@@ -1566,7 +1597,6 @@ class StickerPlugin(Star):
                         total = progress.get("total_files") or 0
                         if total:
                             progress["percent"] = int(len(files_meta) * 100 / total)
-                        # 每 50 个文件或每 0.5 秒刷一次：回调本身不能成为瓶颈
                         now = time.time()
                         if done_since_flush >= 50 or now - last_flush >= 0.5:
                             done_since_flush = 0
@@ -1586,14 +1616,9 @@ class StickerPlugin(Star):
                     indent=2,
                 ),
             )
-        # 生成后立刻按策略清理：本次刚生成的这份永不删
-        removed = self._prune_backups(keep_name=filename)
         return {
-            "filename": filename,
-            "size": target.stat().st_size,
             "keywords": len(payload_index),
             "images": len(files_meta),
-            "pruned": removed,
         }
 
     def _prune_backups(self, keep_name: Optional[str] = None) -> List[str]:
@@ -1601,22 +1626,40 @@ class StickerPlugin(Star):
 
         保护名单：keep_name（本次刚生成）与 pre-restore_*（恢复前快照，只能人工删）。
         """
+        # 逐条容错：某一份 stat 失败（被外部删除/权限变化）不能让整份清理静默失效（审计 M3）
+        backups = []
         try:
-            # 只淘汰自动备份与恢复快照：export_* 是用户主动导出的产物，不动
-            backups = [
-                p
-                for p in self.backup_root.glob("*.zip")
-                if p.is_file() and (p.name.startswith("sticker_backup") or p.name.startswith("pre-restore"))
-            ]
+            candidates = list(self.backup_root.glob("*.zip"))
         except OSError:
             return []
+        for candidate in candidates:
+            # 只淘汰自动备份与恢复快照：export_* 是用户主动导出的产物，不动
+            if not (
+                candidate.name.startswith("sticker_backup")
+                or candidate.name.startswith("pre-restore")
+            ):
+                continue
+            try:
+                if not candidate.is_file():
+                    continue
+            except OSError:
+                continue
+            backups.append(candidate)
         protected = {name for name in (keep_name,) if name}
         removed: List[str] = []
+
+        def _mtime(path: Path) -> float:
+            # stat 可能失败（文件被外部删除/权限变化）：排序与淘汰都不能因此整份崩掉（审计 M3）
+            try:
+                return path.stat().st_mtime
+            except OSError:
+                return 0.0
+
         # pre-restore_* 不参与常规淘汰，但只保留最新一份：
         # 否则每次恢复都多 600MB 级快照，磁盘会被快照吃满（线上剩余空间 <5GB）。
         snapshots = sorted(
             (p for p in backups if p.name.startswith("pre-restore")),
-            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            key=_mtime,
         )
         for stale_snapshot in snapshots[:-1]:
             try:
@@ -1634,7 +1677,7 @@ class StickerPlugin(Star):
             except OSError:
                 return 0
 
-        backups.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+        backups.sort(key=_mtime)
         keep = self._backup_keep()
         total_limit = self._backup_total_mb() * 1024 * 1024
 
@@ -1644,7 +1687,15 @@ class StickerPlugin(Star):
                     return candidate
             return None
 
-        while len(backups) > keep:
+        def _countable() -> int:
+            # 份数上限只约束自动备份：pre-restore_* 受单独策略管，export_* 完全不参与（审计 M4）
+            return sum(
+                1
+                for path in backups
+                if path.name.startswith("sticker_backup")
+            )
+
+        while _countable() > keep:
             victim = _victim()
             if victim is None:
                 break
@@ -1909,8 +1960,7 @@ class StickerPlugin(Star):
         if keyword in self.blocked_keywords:
             yield event.plain_result(f"关键词 {keyword} 已被屏蔽，无法添加")
             return
-        added, skipped, failed = await self._add_images(keyword, images)
-        blocked = self.__dict__.pop("_last_storage_blocked", None)
+        added, skipped, failed, blocked = await self._add_images(keyword, images)
         if blocked:
             yield event.plain_result(f"添加失败：{blocked}")
             return

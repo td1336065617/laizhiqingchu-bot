@@ -74,12 +74,13 @@ def test_add_images_blocked_leaves_no_trace(tmp_path):
     main, bot = _bot(tmp_path, limit_mb=1)
     _write(bot.data_dir / "清楚" / "1.jpg", 2 * 1024 * 1024)
 
-    result = asyncio.run(bot._add_images("新词", []))
+    added, skipped, failed, reason = asyncio.run(bot._add_images("新词", []))
 
-    assert result == (0, 0, 0)
+    assert (added, skipped, failed) == (0, 0, 0)
     assert not (bot.data_dir / "新词").exists(), "被拒时不得创建目录"
     assert "新词" not in bot.index
-    assert "存储已满" in bot._last_storage_blocked
+    assert reason and "存储已满" in reason
+    assert not hasattr(bot, "_last_storage_blocked"), "拒绝原因走返回值，不留实例状态"
 
 
 def test_check_storage_warns_with_backup_info(tmp_path, caplog):
