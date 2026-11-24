@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS image (
     UNIQUE(kw, filename)
 );
 CREATE INDEX IF NOT EXISTS ix_image_kw ON image(kw, id);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_image_md5 ON image(kw, md5) WHERE md5 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_image_md5 ON image(md5);
 CREATE TABLE IF NOT EXISTS alias_group (
     primary_kw TEXT PRIMARY KEY REFERENCES keyword(k) ON DELETE CASCADE,
     created_at REAL
@@ -87,6 +87,10 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(DDL)
         self.conn.commit()
+        # 早期版本在 (kw, md5) 上建了 UNIQUE：同一关键词里本来就可能有多张相同图片
+        # （去重场景），撞唯一约束会让整批回填写入回滚。这里一次性纠正。
+        self.conn.execute("DROP INDEX IF EXISTS ux_image_md5")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS ix_image_md5 ON image(md5)")
         self.conn.execute(
             "INSERT OR IGNORE INTO meta(k, v) VALUES(?, ?)", ("schema_version", str(SCHEMA_VERSION))
         )

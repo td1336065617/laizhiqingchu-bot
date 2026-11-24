@@ -265,6 +265,12 @@ class StickerPlugin(Star):
                 "表情包数据备份（生成压缩包）",
             )
             self.context.register_web_api(
+                f"/{PLUGIN_NAME}/maintenance/backfill-md5",
+                self._web_maintenance_backfill_md5,
+                ["POST"],
+                "把图片 MD5 回填进 SQLite（迁移后一次性）",
+            )
+            self.context.register_web_api(
                 f"/{PLUGIN_NAME}/maintenance/scan",
                 self._web_maintenance_scan,
                 ["GET"],
@@ -1482,6 +1488,14 @@ class StickerPlugin(Star):
             return error_response(f"读取备份列表失败：{exc}")
         return json_response({"status": "success", "data": {"backups": items}})
 
+    async def _web_maintenance_backfill_md5(self):
+        try:
+            report = await asyncio.to_thread(self._backfill_md5)
+        except Exception as exc:
+            logger.error("MD5 回填失败: %s", exc, exc_info=True)
+            return error_response(f"回填失败：{exc}")
+        return json_response({"status": "success", "data": report})
+
     async def _web_maintenance_scan(self):
         try:
             report = await asyncio.to_thread(self._scan_orphans)
@@ -2253,6 +2267,40 @@ class StickerPlugin(Star):
             else:
                 lines.append(f"- {self._mask_id(entry)}（全平台）")
         yield event.plain_result("\n".join(lines))
+
+    # ---------------- 维护：MD5 回填 ----------------
+    def _backfill_md5(self, limit_keywords: Optional[int] = None) -> dict:
+        """把 MD5 一次性回填进库（迁移后 DB 里 md5 全空，去重/按图删图用不上）。
+
+        用 _folder_md5s 走同一条路径：它会把算出的 MD5 回写 DB，并自带缓存。
+        线上 637MB 按 1MB 分块约 1-3 秒。
+        """
+        started = time.time()
+        scanned = filled = 0
+        keywords = list(self.index)
+        if limit_keywords:
+            keywords = keywords[:limit_keywords]
+        for keyword in keywords:
+            try:
+                mapping = self._folder_md5s(keyword)
+            except Exception as exc:
+                logger.warning("回填 MD5 失败（%s）: %s", keyword, exc)
+                continue
+            scanned += len(mapping)
+            filled += sum(1 for value in mapping.values() if value)
+        report = {
+            "keywords": len(keywords),
+            "images": scanned,
+            "with_md5": filled,
+            "seconds": round(time.time() - started, 2),
+        }
+        logger.info(
+            "MD5 回填完成：%d 关键词 / %d 张 / 耗时 %.1fs",
+            report["keywords"],
+            report["images"],
+            report["seconds"],
+        )
+        return report
 
     # ---------------- 维护：孤儿对账 / 去重 ----------------
     def _scan_orphans(self) -> dict:

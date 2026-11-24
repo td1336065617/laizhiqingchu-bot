@@ -75,6 +75,12 @@
 <div class="card">
   <h2>备份与恢复</h2>
   <div class="row" style="margin-bottom:12px">
+    <label>单图上限（MB，0 = 不限）</label>
+    <input type="number" id="maxImageInput" min="0" max="50">
+    <button id="btnScan" class="secondary">扫描孤儿</button>
+    <button id="btnDedupe" class="secondary">去重（先干跑）</button>
+  </div>
+  <div class="row" style="margin-bottom:12px">
     <button id="btnBackup">立即备份（打包 zip）</button>
     <span class="muted">将全部关键词与图片打包，含数据校验清单</span>
   </div>
