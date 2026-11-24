@@ -424,6 +424,10 @@ class StickerPlugin(Star):
             return
 
         added, skipped, failed = await self._add_images(keyword, images)
+        blocked = self.__dict__.pop("_last_storage_blocked", None)
+        if blocked:
+            yield event.plain_result(f"添加失败：{blocked}")
+            return
         if failed:
             yield event.plain_result(
                 f"成功添加 {added} 张图片（跳过 {skipped} 张重复，{failed} 张下载失败）"
@@ -457,6 +461,14 @@ class StickerPlugin(Star):
         self, keyword: str, images: List[Image]
     ) -> Tuple[int, int, int]:
         """把图片批量写入关键词目录（MD5 去重），返回 (新增, 跳过重复, 下载失败)。"""
+        self.__dict__.pop("_last_storage_blocked", None)
+        reason = self._enforce_storage()
+        if reason:
+            # 拒绝写入：不建目录、不落盘、不动索引
+            self._last_storage_blocked = reason
+            logger.warning("拒绝添加图片（%s）：%s", keyword, reason)
+            return 0, 0, 0
+
         folder = self.data_dir / keyword
         folder.mkdir(parents=True, exist_ok=True)
         # 目录级 MD5 缓存：原来每次添加都要把整个关键词目录重算一遍（线上 637MB 约 2.5s）
@@ -1088,6 +1100,67 @@ class StickerPlugin(Star):
         except (TypeError, ValueError):
             return DEFAULT_MAX_STORAGE_MB
 
+    def _storage_usage(self) -> dict:
+        """全仓唯一的用量口径：贴纸库 + 备份目录分开统计。
+
+        贴纸库按 (st_dev, st_ino) 去重——P3 的硬链接归并会让同一份内容出现多个目录项，
+        按文件累加会把用量算高。备份目录是 data_dir 的兄弟目录（见 __init__），
+        原来用 rglob(data_dir) 统计永远漏掉它，导致 955MB 备份不参与上限判断。
+        """
+        limit_mb = self._max_storage_mb()
+        seen = set()
+        used = 0
+        files = 0
+        if self.data_dir.exists():
+            for path in self.data_dir.rglob("*"):
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                if not path.is_file():
+                    continue
+                key = (stat.st_dev, stat.st_ino)
+                if key in seen:
+                    continue
+                seen.add(key)
+                used += stat.st_size
+                files += 1
+
+        backup_bytes = 0
+        backup_count = 0
+        try:
+            for path in self.backup_root.glob("*.zip"):
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    continue
+                backup_bytes += size
+                backup_count += 1
+        except OSError:
+            pass
+
+        return {
+            "used_mb": round(used / 1048576, 1),
+            "limit_mb": limit_mb,
+            "files": files,
+            "backup_mb": round(backup_bytes / 1048576, 1),
+            "backup_count": backup_count,
+        }
+
+    def _enforce_storage(self) -> Optional[str]:
+        """超上限时返回可直接回给用户的文案，否则 None。
+
+        以前只在启动时 warning 一次，运行中涨到多少都不管；线上 636MB/2010MB 从未触发。
+        现在每次新增前都判，超了就拒绝写入（不落盘、不动索引）。
+        """
+        usage = self._storage_usage()
+        if usage["used_mb"] > usage["limit_mb"]:
+            return (
+                f"存储已满（当前 {usage['used_mb']}MB / 上限 {usage['limit_mb']}MB，"
+                f"共 {usage['files']} 张）：请先删除部分关键词，或调高上限后重试"
+            )
+        return None
+
     def _apply_config_payload(self, payload: dict) -> dict:
         """校验并保存后台配置，返回实际更新的字段。"""
         # 先整体校验到临时表，全部通过再落内存：避免"admin 已改、ai 报错"的半状态
@@ -1562,6 +1635,10 @@ class StickerPlugin(Star):
             yield event.plain_result(f"关键词 {keyword} 已被屏蔽，无法添加")
             return
         added, skipped, failed = await self._add_images(keyword, images)
+        blocked = self.__dict__.pop("_last_storage_blocked", None)
+        if blocked:
+            yield event.plain_result(f"添加失败：{blocked}")
+            return
         if failed:
             yield event.plain_result(
                 f"已从合并转发添加 {added} 张图片"
@@ -1783,25 +1860,14 @@ class StickerPlugin(Star):
             logger.error("保存索引失败: %s", exc)
 
     def _check_storage(self):
-        try:
-            limit_mb = int(
-                self.config.get("max_storage_mb", DEFAULT_MAX_STORAGE_MB)
-                or DEFAULT_MAX_STORAGE_MB
-            )
-        except (TypeError, ValueError):
-            limit_mb = DEFAULT_MAX_STORAGE_MB
-        limit = limit_mb * 1024 * 1024
-        total = 0
-        if self.data_dir.exists():
-            for f in self.data_dir.rglob("*"):
-                if f.is_file():
-                    try:
-                        total += f.stat().st_size
-                    except OSError:
-                        continue
-        if total > limit:
+        """启动时检查一次并告警（真正的拦截在 _enforce_storage，每次新增前调用）。"""
+        usage = self._storage_usage()
+        if usage["used_mb"] > usage["limit_mb"]:
             logger.warning(
-                "表情包存储已超过 %dMB（当前 %.1fMB），请清理",
-                limit_mb,
-                total / 1024 / 1024,
+                "表情包存储已超过 %dMB（当前 %.1fMB，共 %d 张；备份另占 %.1fMB / %d 份），请清理",
+                usage["limit_mb"],
+                usage["used_mb"],
+                usage["files"],
+                usage["backup_mb"],
+                usage["backup_count"],
             )
