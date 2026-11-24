@@ -145,7 +145,8 @@
           const mb = Number(document.getElementById('mbInput').value) || maxStorageMb;
       const keep = Number(document.getElementById('backupKeepInput').value) || 2;
       const totalMb = Number(document.getElementById('backupTotalInput').value) || 1024;
-          await A.apiPost('config', { admin_users: adminUsers, max_storage_mb: mb, backup_keep: keep, backup_total_mb: totalMb });
+          const maxImg = Number(document.getElementById('maxImageInput').value) || 0;
+          await A.apiPost('config', { admin_users: adminUsers, max_storage_mb: mb, backup_keep: keep, backup_total_mb: totalMb, max_image_mb: maxImg });
           show('管理员已移除并保存');
         } catch (e) {
           show('保存失败：' + (e && e.message ? e.message : e), true);
@@ -181,6 +182,7 @@
       document.getElementById('mbInput').value = maxStorageMb;
       document.getElementById('backupKeepInput').value = (r && r.backup_keep) || 2;
       document.getElementById('backupTotalInput').value = (r && r.backup_total_mb) || 1024;
+      document.getElementById('maxImageInput').value = (r && typeof r.max_image_mb === 'number') ? r.max_image_mb : 10;
       const ai = (r && r.ai) || {};
       const pickAi = (key, fallback) => (ai[key] === undefined || ai[key] === null ? fallback : ai[key]);
       document.getElementById('aiToolsOn').checked = pickAi('sticker_ai_tools_enabled', true) !== false;
@@ -276,7 +278,8 @@
         sticker_ai_throttle_window: Number(document.getElementById('aiThrottleWindow').value),
         sticker_ai_send_dedup_window: Number(document.getElementById('aiSendDedup').value),
       };
-      const r = await A.apiPost('config', { admin_users: adminUsers, max_storage_mb: mb, backup_keep: keep, backup_total_mb: totalMb, ai: ai });
+      const maxImg = Number(document.getElementById('maxImageInput').value) || 0;
+      const r = await A.apiPost('config', { admin_users: adminUsers, max_storage_mb: mb, backup_keep: keep, backup_total_mb: totalMb, max_image_mb: maxImg, ai: ai });
       show('配置已保存并生效');
       await loadConfig();
     } catch (e) {
@@ -325,6 +328,44 @@
       refreshBackups();
     } catch (e) {
       show('导出失败：' + (e && e.message ? e.message : e), true);
+    }
+  };
+
+  document.getElementById('btnScan').onclick = async () => {
+    try {
+      show('正在扫描...');
+      const r = await A.apiGet('maintenance/scan');
+      const d = (r && r.data) || {};
+      show(
+        '磁盘有索引无：' + ((d.disk_only_keywords || []).join('、') || '无') +
+        '\n索引有磁盘无：' + ((d.index_only_keywords || []).join('、') || '无') +
+        '\n缺失文件：' + (d.missing_files_total || 0) + ' 个' +
+        '\n空目录：' + ((d.empty_dirs || []).join('、') || '无')
+      );
+    } catch (e) {
+      show('扫描失败：' + (e && e.message ? e.message : e), true);
+    }
+  };
+
+  document.getElementById('btnDedupe').onclick = async () => {
+    const btn = document.getElementById('btnDedupe');
+    try {
+      if (btn.dataset.armed !== '1') {
+        const r = await A.apiPost('maintenance/dedupe', {});
+        const d = (r && r.data) || {};
+        show('干跑结果：可归并 ' + (d.groups || 0) + ' 组 / ' + (d.files || 0) + ' 个文件，预计回收 ' + (d.reclaimed_mb || 0) + 'MB。\n确认执行请再次点击「去重」（10 秒内）。');
+        btn.dataset.armed = '1';
+        btn.textContent = '再次点击确认去重';
+        setTimeout(() => { btn.dataset.armed = ''; btn.textContent = '去重（先干跑）'; }, 10000);
+        return;
+      }
+      btn.dataset.armed = '';
+      btn.textContent = '去重（先干跑）';
+      const r = await A.apiPost('maintenance/dedupe', { apply: true });
+      const d = (r && r.data) || {};
+      show('去重完成：' + (d.done || 0) + ' 个文件归并，失败 ' + (d.failed || 0) + ' 个，回收约 ' + (d.reclaimed_mb || 0) + 'MB');
+    } catch (e) {
+      show('去重失败：' + (e && e.message ? e.message : e), true);
     }
   };
 

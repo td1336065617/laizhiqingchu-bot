@@ -12,7 +12,6 @@ JSON 镜像继续写（`index.json`），保证旧版可恢复、备份格式不
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 from pathlib import Path

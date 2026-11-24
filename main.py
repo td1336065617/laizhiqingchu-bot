@@ -95,6 +95,8 @@ PAGE_SIZE = 10
 # 默认存储上限（MB），可通过 _conf_schema.json 的 max_storage_mb 覆盖
 DEFAULT_MAX_STORAGE_MB = 200
 # 默认备份保留：份数上限与总量上限（MB）。pre-restore_* 永不参与自动清理
+# 单图上限（MB）：线上 93% 的图 <1MB，10MB 只影响 3 个文件（0.13%）
+DEFAULT_MAX_IMAGE_MB = 10
 DEFAULT_BACKUP_KEEP = 2
 DEFAULT_BACKUP_TOTAL_MB = 1024
 # 允许保留的图片扩展名（convert_to_file_path 可能返回无后缀的临时文件）
@@ -261,6 +263,18 @@ class StickerPlugin(Star):
                 self._web_backup,
                 ["GET"],
                 "表情包数据备份（生成压缩包）",
+            )
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/maintenance/scan",
+                self._web_maintenance_scan,
+                ["GET"],
+                "孤儿对账：磁盘与索引双向差异（只读）",
+            )
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/maintenance/dedupe",
+                self._web_maintenance_dedupe,
+                ["POST"],
+                "按内容去重（默认干跑，apply=true 才执行硬链接归并）",
             )
             self.context.register_web_api(
                 f"/{PLUGIN_NAME}/backup/progress",
@@ -543,6 +557,7 @@ class StickerPlugin(Star):
         added = 0
         skipped = 0
         failed = 0
+        refused = 0
         for img in images:
             try:
                 # 统一媒体处理：本地路径 / file:// / URL / base64 均会落地为本地文件
@@ -555,6 +570,21 @@ class StickerPlugin(Star):
                 logger.warning("图片本地化后文件不存在: %s", tmp_path)
                 failed += 1
                 continue
+            limit_mb = self._max_image_mb()
+            if limit_mb:
+                try:
+                    size_mb = tmp_path.stat().st_size / 1048576
+                except OSError:
+                    size_mb = 0
+                if size_mb > limit_mb:
+                    refused += 1
+                    logger.warning(
+                        "跳过超大图片（%s）：%.1fMB > 上限 %dMB",
+                        tmp_path.name,
+                        size_mb,
+                        limit_mb,
+                    )
+                    continue
             try:
                 file_md5 = self._md5(tmp_path)
             except OSError as exc:
@@ -583,8 +613,13 @@ class StickerPlugin(Star):
             self.index.setdefault(keyword, []).append(filename)
             added += 1
 
+        if refused:
+            self.__dict__["_last_refused_count"] = refused
         self._save_index()
-        return added, skipped, failed, None
+        reason = None
+        if refused and not added and not skipped:
+            reason = f"全部 {refused} 张都超过单图上限（{self._max_image_mb()}MB），已跳过"
+        return added, skipped, failed, reason
 
     # ------------------------------------------------------------------
     # B. 发送（来只{关键词}）
@@ -1192,6 +1227,13 @@ class StickerPlugin(Star):
         except (TypeError, ValueError):
             return DEFAULT_MAX_STORAGE_MB
 
+    def _max_image_mb(self) -> int:
+        try:
+            value = int(self.config.get("max_image_mb", DEFAULT_MAX_IMAGE_MB))
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_IMAGE_MB
+        return value if 0 <= value <= 50 else DEFAULT_MAX_IMAGE_MB
+
     def _backup_keep(self) -> int:
         try:
             value = int(self.config.get("backup_keep", DEFAULT_BACKUP_KEEP))
@@ -1439,6 +1481,24 @@ class StickerPlugin(Star):
             logger.error("读取备份列表失败: %s", exc)
             return error_response(f"读取备份列表失败：{exc}")
         return json_response({"status": "success", "data": {"backups": items}})
+
+    async def _web_maintenance_scan(self):
+        try:
+            report = await asyncio.to_thread(self._scan_orphans)
+        except Exception as exc:
+            logger.error("孤儿扫描失败: %s", exc, exc_info=True)
+            return error_response(f"扫描失败：{exc}")
+        return json_response({"status": "success", "data": report})
+
+    async def _web_maintenance_dedupe(self):
+        payload = await request.json(default=None)
+        dry_run = True if not isinstance(payload, dict) else bool(payload.get("apply") is not True)
+        try:
+            report = await asyncio.to_thread(self._dedupe_by_hardlink, dry_run)
+        except Exception as exc:
+            logger.error("去重失败: %s", exc, exc_info=True)
+            return error_response(f"去重失败：{exc}")
+        return json_response({"status": "success", "data": report})
 
     async def _web_backup_progress(self):
         state = self.__dict__.get("_backup_state") or {"state": "idle", "percent": 0}
@@ -2193,6 +2253,112 @@ class StickerPlugin(Star):
             else:
                 lines.append(f"- {self._mask_id(entry)}（全平台）")
         yield event.plain_result("\n".join(lines))
+
+    # ---------------- 维护：孤儿对账 / 去重 ----------------
+    def _scan_orphans(self) -> dict:
+        """只读对账：磁盘有但索引没有、索引有但磁盘没有、空目录。"""
+        disk = {}
+        try:
+            for entry in self.data_dir.iterdir():
+                if not entry.is_dir() or entry.name in ("__pycache__",):
+                    continue
+                try:
+                    files = [f.name for f in entry.iterdir() if f.is_file()]
+                except OSError:
+                    continue
+                disk[entry.name] = files
+        except OSError as exc:
+            logger.error("扫描贴纸目录失败: %s", exc)
+            return {"error": str(exc)}
+
+        indexed = {k: list(v) for k, v in self.index.items()}
+        disk_only_keywords = sorted(set(disk) - set(indexed))
+        index_only_keywords = sorted(set(indexed) - set(disk))
+        missing_files = []
+        for keyword, names in indexed.items():
+            present = set(disk.get(keyword, []))
+            for name in names:
+                if name not in present:
+                    missing_files.append(f"{keyword}/{name}")
+        empty_dirs = sorted(k for k, files in disk.items() if not files)
+        return {
+            "disk_only_keywords": disk_only_keywords,
+            "index_only_keywords": index_only_keywords,
+            "missing_files": missing_files[:200],
+            "missing_files_total": len(missing_files),
+            "empty_dirs": empty_dirs,
+        }
+
+    def _dedupe_by_hardlink(self, dry_run: bool = True) -> dict:
+        """把内容相同的图片归并成硬链接（同一份数据只占一次空间）。
+
+        只链不删：每个关键词目录里的文件名都保留，索引零改动，可逆。
+        """
+        groups: dict = {}
+        for keyword, names in self.index.items():
+            folder = self.data_dir / keyword
+            for name in names:
+                path = folder / name
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                if stat.st_nlink > 1:
+                    continue
+                key = (stat.st_size, self._md5(path))
+                groups.setdefault(key, []).append(path)
+
+        plans = []
+        reclaimed = 0
+        for (size, _digest), paths in groups.items():
+            if len(paths) < 2:
+                continue
+            paths.sort(key=lambda p: p.stat().st_mtime)
+            keep, duplicates = paths[0], paths[1:]
+            plans.append(
+                {
+                    "keep": str(keep.relative_to(self.data_dir)),
+                    "linked": [str(p.relative_to(self.data_dir)) for p in duplicates],
+                    "bytes": size * len(duplicates),
+                }
+            )
+            reclaimed += size * len(duplicates)
+
+        result = {
+            "dry_run": dry_run,
+            "groups": len(plans),
+            "files": sum(len(item["linked"]) for item in plans),
+            "reclaimed_mb": round(reclaimed / 1048576, 1),
+            "plans": plans[:200],
+        }
+        if dry_run:
+            return result
+
+        done, failed = 0, 0
+        for item in plans:
+            keep = self.data_dir / item["keep"]
+            for rel in item["linked"]:
+                target = self.data_dir / rel
+                try:
+                    tmp = target.with_suffix(target.suffix + ".lnk")
+                    if tmp.exists():
+                        tmp.unlink()
+                    os.link(keep, tmp)
+                    os.replace(tmp, target)
+                    done += 1
+                except OSError as exc:
+                    failed += 1
+                    logger.warning("硬链接归并失败（%s）: %s", rel, exc)
+                    try:
+                        if tmp.exists():
+                            tmp.unlink()
+                    except OSError:
+                        pass
+        result["done"] = done
+        result["failed"] = failed
+        if done:
+            logger.info("硬链接去重完成：%d 个文件，回收约 %.1fMB", done, result["reclaimed_mb"])
+        return result
 
     # ---------------- 别名组指令 ----------------
     async def _handle_bind(self, event: AstrMessageEvent, message_str: str):
