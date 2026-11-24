@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -79,7 +80,10 @@ class Store:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path), timeout=5.0)
+        # 备份/回填都在 asyncio.to_thread 里跑，连接必须允许跨线程；
+        # 单连接多线程写会互相踩，所以再用一把可重入锁串行化写操作。
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
@@ -121,11 +125,17 @@ class Store:
 
     # ---- 索引读写 ----
     def load_index(self) -> Dict[str, List[str]]:
+        # LEFT JOIN：没有图片的关键词也要保留，否则重启后关键词凭空消失（P1 审计 G3）
         index: Dict[str, List[str]] = {}
-        for row in self.conn.execute(
-            "SELECT kw, filename FROM image ORDER BY kw, id"
-        ):
-            index.setdefault(row["kw"], []).append(row["filename"])
+        with self._lock:
+            for row in self.conn.execute(
+                "SELECT k FROM keyword ORDER BY k"
+            ):
+                index[row["k"]] = []
+            for row in self.conn.execute(
+                "SELECT kw, filename FROM image ORDER BY kw, id"
+            ):
+                index.setdefault(row["kw"], []).append(row["filename"])
         return index
 
     def sync_index(self, index: Dict[str, List[str]], md5_of=None) -> None:
@@ -134,12 +144,21 @@ class Store:
         md5_of: 可选的 `callable(kw, filename) -> (md5, bytes, ext)`，用于补全 MD5 列。
         数据量级（线上 2268 行）全量重写是毫秒级，比做 diff 更简单可靠。
         """
-        with self.conn:
-            self.conn.execute("DELETE FROM image")
-            self.conn.execute("DELETE FROM keyword")
+        with self._lock, self.conn:
+            # 差量同步：绝不能 DELETE keyword——alias/alias_group 对它有外键级联，
+            # 每存一次索引就把别名/管理员清空一次（P1 审计 G2）。
+            wanted_kw = set(index)
+            existing_kw = {
+                row["k"] for row in self.conn.execute("SELECT k FROM keyword")
+            }
+            for stale in existing_kw - wanted_kw:
+                self.conn.execute("DELETE FROM keyword WHERE k=?", (stale,))
             for kw, names in index.items():
+                # 用 DO NOTHING 而不是 OR REPLACE：REPLACE 会先删后插，
+                # 触发 alias/alias_group 的 ON DELETE CASCADE，把别名表清空。
                 self.conn.execute(
-                    "INSERT OR REPLACE INTO keyword(k, blocked, created_at) VALUES(?, 0, ?)",
+                    "INSERT INTO keyword(k, blocked, created_at) VALUES(?, 0, ?) "
+                    "ON CONFLICT(k) DO NOTHING",
                     (kw, 0),
                 )
                 for filename in names:
@@ -155,6 +174,14 @@ class Store:
                         "VALUES(?, ?, ?, ?, ?, ?)",
                         (kw, filename, md5, ext, size, 0),
                     )
+                placeholders = ",".join("?" for _ in names) or "''"
+                if names:
+                    self.conn.execute(
+                        f"DELETE FROM image WHERE kw=? AND filename NOT IN ({placeholders})",
+                        (kw, *names),
+                    )
+                else:
+                    self.conn.execute("DELETE FROM image WHERE kw=?", (kw,))
 
     def md5s_of(self, keyword: str) -> Dict[str, str]:
         rows = self.conn.execute(
@@ -163,7 +190,7 @@ class Store:
         return {row["filename"]: row["md5"] for row in rows}
 
     def set_md5(self, keyword: str, filename: str, md5: str, size: Optional[int], ext: Optional[str]) -> None:
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute(
                 "UPDATE image SET md5=?, bytes=?, ext=? WHERE kw=? AND filename=?",
                 (md5, size, ext, keyword, filename),
@@ -173,7 +200,7 @@ class Store:
         """批量补 MD5（避免逐条事务）。"""
         if not mapping:
             return
-        with self.conn:
+        with self._lock, self.conn:
             for filename, digest in mapping.items():
                 self.conn.execute(
                     "UPDATE image SET md5=? WHERE kw=? AND filename=?",
@@ -198,13 +225,13 @@ class Store:
         return [(row["kw"], row["filename"]) for row in rows]
 
     def remove_files(self, pairs: Iterable[Tuple[str, str]]) -> None:
-        with self.conn:
+        with self._lock, self.conn:
             for kw, filename in pairs:
                 self.conn.execute("DELETE FROM image WHERE kw=? AND filename=?", (kw, filename))
 
     def clear_content(self) -> None:
         """清空贴纸内容，但保留 meta / admin / admin_audit。"""
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute("DELETE FROM image")
             self.conn.execute("DELETE FROM keyword")
             self.conn.execute("DELETE FROM alias")
@@ -212,7 +239,7 @@ class Store:
 
     def prune_keyword(self, keyword: str, keep: Iterable[str]) -> None:
         keep_set = set(keep)
-        with self.conn:
+        with self._lock, self.conn:
             for row in self.conn.execute(
                 "SELECT filename FROM image WHERE kw=?", (keyword,)
             ).fetchall():
@@ -225,7 +252,7 @@ class Store:
     def migrate(self, index: Dict[str, List[str]], md5_of=None) -> Dict[str, int]:
         """幂等迁移：已有数据时只补差，返回值用于和 JSON 对账。"""
         if self.schema_version() < SCHEMA_VERSION:
-            with self.conn:
+            with self._lock, self.conn:
                 self.conn.execute(
                     "INSERT OR REPLACE INTO meta(k, v) VALUES(?, ?)",
                     ("schema_version", str(SCHEMA_VERSION)),

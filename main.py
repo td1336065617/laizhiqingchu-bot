@@ -398,6 +398,16 @@ class StickerPlugin(Star):
         if not message_str:
             return
 
+        # 平台会往正文注入 @ 记号（<@id> / [CQ:at,qq=]）。不剥掉的话，
+        # 「<@!ID> 授予管理员」永远不命中前缀（P2 审计 7）。
+        message_str = re.sub(
+            r"^(?:<@!?[A-Za-z0-9_-]{6,}>\s*|\[CQ:at,qq=[^\]]+\]\s*)+",
+            "",
+            message_str,
+        ).strip()
+        if not message_str:
+            return
+
         try:
             if message_str.startswith("批量添加合并转发"):
                 async for result in self._handle_batch_add_forward(event, message_str):
@@ -459,15 +469,14 @@ class StickerPlugin(Star):
     # A. 添加（回复消息中包含图片才触发，否则完全无视）
     # ------------------------------------------------------------------
     async def _handle_add(self, event: AstrMessageEvent, message_str: str):
-        keyword = message_str[2:].strip()
-        raw_keyword = keyword
-        keyword, _how = self._resolve_keyword(raw_keyword)
-        if not keyword:
-            yield event.plain_result('关键词 ' + raw_keyword + ' 不存在')
-            return
-        if not keyword:
+        raw_keyword = message_str[2:].strip()
+        if not raw_keyword:
             yield event.plain_result("用法：添加{关键词}（请回复包含图片的消息）")
             return
+        # 别名命中就落到主词；未命中保留原文——添加本来就可以新建关键词
+        keyword, _how = self._resolve_keyword(raw_keyword)
+        if not keyword:
+            keyword = raw_keyword
         if not self._is_valid_keyword(keyword):
             yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
@@ -520,12 +529,12 @@ class StickerPlugin(Star):
     ):
         """批量添加合并转发：先发送命令，90 秒内本人发送的合并转发自动入库。"""
         raw_keyword = message_str[len("批量添加合并转发") :].strip()
-        keyword, _how = self._resolve_keyword(raw_keyword)
-        if not keyword:
-            yield event.plain_result("关键词 " + raw_keyword + " 不存在，请先用 添加 建立")
-        if not keyword:
+        if not raw_keyword:
             yield event.plain_result("用法：批量添加合并转发{关键词}")
             return
+        keyword, _how = self._resolve_keyword(raw_keyword)
+        if not keyword:
+            keyword = raw_keyword
         if not self._is_valid_keyword(keyword):
             yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
@@ -672,6 +681,8 @@ class StickerPlugin(Star):
         if not keyword:
             yield event.plain_result("用法：列表{关键词}{页码}（页码可选）")
             return
+        resolved, _how = self._resolve_keyword(keyword)
+        keyword = resolved or keyword
         if not self._is_valid_keyword(keyword):
             yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
@@ -710,16 +721,15 @@ class StickerPlugin(Star):
             return
 
         rest = message_str[2:].strip()
-        raw_keyword = rest
-        rest, _how = self._resolve_keyword(raw_keyword)
-        if not rest:
-            yield event.plain_result('关键词 ' + raw_keyword + ' 不存在')
-            return
         match = re.search(r"(\d+)\s*$", rest)
         if not match:
             yield event.plain_result("用法：删图（回复要删除的图片），或删图{关键词}{序号}")
             return
-        keyword = rest[: match.start()].strip()
+        # 先剥序号再解析词干：反过来会把「词+序号」整串当关键词，永远解析失败
+        keyword_part = rest[: match.start()].strip()
+        keyword, _how = self._resolve_keyword(keyword_part)
+        if not keyword:
+            keyword = keyword_part
         index = int(match.group(1))
         if not keyword:
             yield event.plain_result("用法：删图（回复要删除的图片），或删图{关键词}{序号}")
@@ -752,6 +762,7 @@ class StickerPlugin(Star):
         else:
             self.index.pop(keyword, None)
         self._save_index()
+        self._drop_alias_group(keyword)
         yield event.plain_result(f"已删除第 {index} 张图片：{filename}")
 
     async def _delete_by_md5(
@@ -1899,6 +1910,7 @@ class StickerPlugin(Star):
         if not isinstance(groups, dict):
             return 0
         merged = 0
+        conflicts = 0
         self.alias_groups = self.__dict__.get("alias_groups") or {}
         known = set(self.index) | set(restored_keywords)
         for primary, payload in groups.items():
@@ -1914,6 +1926,11 @@ class StickerPlugin(Star):
             bucket = self.alias_groups.setdefault(primary, [])
             for alias in aliases:
                 if not alias or alias == primary or alias in self.index:
+                    continue
+                owner = self.alias_map.get(alias)
+                if owner and owner != primary:
+                    # 本机已有归属：保留本地，不静默改绑（P2 审计 11）
+                    conflicts += 1
                     continue
                 if alias not in bucket:
                     bucket.append(alias)
@@ -2136,8 +2153,14 @@ class StickerPlugin(Star):
             logger.warning("写入管理员审计失败: %s", exc)
 
     def _write_admins(self, entries: list, *, actor: str, action: str, target: str) -> None:
+        # 先落盘再生效：否则保存失败时会出现"回你保存失败，但该人已经能用"（P2 审计 8）
+        previous = list(self.config.get("admin_users") or [])
         self.config["admin_users"] = entries
-        self.config.save_config()
+        try:
+            self.config.save_config()
+        except Exception:
+            self.config["admin_users"] = previous
+            raise
         self._audit_admin(action, actor, target, "ok")
 
     def _mask_id(self, value: str) -> str:
@@ -2253,6 +2276,9 @@ class StickerPlugin(Star):
         yield event.plain_result(f"已撤销 {len(removed)} 人管理员权限")
 
     async def _handle_admin_list(self, event: AstrMessageEvent):
+        if not self._is_admin(event):
+            yield event.plain_result("此指令仅限管理员")
+            return
         admins = self._admin_entries()
         if not admins:
             yield event.plain_result(
@@ -2450,6 +2476,7 @@ class StickerPlugin(Star):
                 f"{alias} 已绑定到 {current}，请先执行 解绑{alias}"
             )
             return
+        snapshot = {k: list(v) for k, v in self.alias_groups.items()}
         self.alias_groups.setdefault(primary, [])
         if alias not in self.alias_groups[primary]:
             self.alias_groups[primary].append(alias)
@@ -2457,6 +2484,8 @@ class StickerPlugin(Star):
         try:
             self._save_groups()
         except OSError as exc:
+            self.alias_groups = snapshot
+            self._refresh_alias_map()
             logger.error("保存别名表失败: %s", exc)
             yield event.plain_result(f"保存别名失败：{exc}")
             return
@@ -2489,6 +2518,10 @@ class StickerPlugin(Star):
         yield event.plain_result(f"已解绑：{alias}")
 
     async def _handle_alias_list(self, event: AstrMessageEvent, message_str: str):
+        # 别名总览会暴露全部关键词关系，按管理员处理（CHANGELOG 也是这么写的）
+        if not self._is_admin(event):
+            yield event.plain_result("此指令仅限管理员")
+            return
         keyword = message_str[len("别名") :].strip()
         if not keyword:
             if not self.alias_groups:
@@ -2546,6 +2579,8 @@ class StickerPlugin(Star):
         if not keyword:
             yield event.plain_result("用法：解除屏蔽{关键词}")
             return
+        resolved, _how = self._resolve_keyword(keyword)
+        keyword = resolved or keyword
         if keyword not in self.blocked_keywords:
             yield event.plain_result(f"关键词 {keyword} 不在屏蔽列表中")
             return
@@ -2865,6 +2900,21 @@ class StickerPlugin(Star):
         self._store = store
         try:
             counts = store.counts()
+            json_images = sum(len(v) for v in self.index.values())
+            if counts["images"] > 0 and json_images > counts["images"]:
+                # JSON 比库新（json 模式期间新增、或上次写库失败）：以 JSON 为准重建库。
+                # 反过来「库非空就无条件覆盖内存」会永久抹掉 JSON 领先的行（P1 审计 S1）。
+                logger.warning(
+                    "JSON(%d 张) 比 SQLite(%d 张) 新，按 JSON 重建库",
+                    json_images,
+                    counts["images"],
+                )
+                rebuilt = store.migrate(self.index, self._md5_for_sync)
+                if rebuilt["images"] != json_images:
+                    raise RuntimeError(
+                        f"重建校验失败：JSON {json_images} 张 vs DB {rebuilt['images']} 张"
+                    )
+                counts = rebuilt
             if counts["images"] == 0:
                 # 库空：把 JSON 索引迁移进来（幂等，迁移前先留一份 .bak）
                 index_file = self.data_dir / "index.json"
@@ -2897,6 +2947,16 @@ class StickerPlugin(Star):
                     )
         except Exception as exc:
             logger.error("SQLite 初始化失败，回落纯 JSON：%s", exc)
+            try:
+                # 迁移/校验失败会留下半份数据：清空内容并打标记，避免下次启动信它
+                store.clear_content()
+                store.conn.execute(
+                    "INSERT OR REPLACE INTO meta(k, v) VALUES(?, ?)",
+                    ("migration_failed", "1"),
+                )
+                store.conn.commit()
+            except Exception:
+                pass
             try:
                 store.close()
             except Exception:
@@ -2934,6 +2994,18 @@ class StickerPlugin(Star):
             for alias in aliases:
                 mapping[alias] = primary
         self.alias_map = mapping
+
+    def _drop_alias_group(self, keyword: str) -> None:
+        """主词被删除时同步摘掉它的别名组，避免悬空别名。"""
+        groups = self.__dict__.get("alias_groups") or {}
+        if keyword not in groups:
+            return
+        groups.pop(keyword, None)
+        self._refresh_alias_map()
+        try:
+            self._save_groups()
+        except OSError as exc:
+            logger.warning("清理别名组失败（%s）: %s", keyword, exc)
 
     def _save_groups(self) -> None:
         payload = {
