@@ -22,6 +22,7 @@ WebUI 后台：在 AstrBot 插件页面的“表情包管理”页中统一管�
 import asyncio
 import hashlib
 import json
+import os
 import random
 import re
 import shutil
@@ -150,6 +151,28 @@ def _resolve_config_path() -> Path:
     return base / "config" / "sticker_plugin_config.json"
 
 
+def _atomic_write_json(path: Path, payload) -> None:
+    """原子写 JSON：同目录 tmp + fsync + os.replace。
+
+    为什么不用 write_text：直接截断覆盖时，崩溃/磁盘满/并发写会把文件留成半截，
+    索引也就跟着坏了。os.replace 在同一文件系统上是原子操作，读到的永远是
+    完整的旧版本或完整的新版本。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # tmp 名必须唯一：固定名会让两个写者共用一个临时文件，
+    # 一个截断另一个的中间结果，rename 后就可能落地半截内容。
+    tmp = path.with_name(f"{path.name}.{os.getpid()}-{time.time_ns()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # 失败时保留 tmp 供诊断，但绝不覆盖目标文件
+        raise
+
+
 class _PluginConfig(dict):
     """无 _conf_schema.json 时插件自管理的配置对象，读写 data/config 下的配置文件。"""
 
@@ -167,9 +190,7 @@ class _PluginConfig(dict):
 
     def save_config(self) -> None:
         try:
-            self.config_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(self, f, ensure_ascii=False, indent=2)
+            _atomic_write_json(self.config_path, dict(self))
         except Exception as exc:
             logger.error("保存插件配置失败: %s", exc)
             raise
@@ -1702,21 +1723,13 @@ class StickerPlugin(Star):
 
     def _save_blocked(self):
         try:
-            self.data_dir.mkdir(parents=True, exist_ok=True)
-            self.blocked_path.write_text(
-                json.dumps(sorted(self.blocked_keywords), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            _atomic_write_json(self.blocked_path, sorted(self.blocked_keywords))
         except OSError as exc:
             logger.error("保存屏蔽列表失败: %s", exc)
 
     def _save_index(self):
         try:
-            self.data_dir.mkdir(parents=True, exist_ok=True)
-            self.index_path.write_text(
-                json.dumps(self.index, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            _atomic_write_json(self.index_path, self.index)
         except OSError as exc:
             logger.error("保存索引失败: %s", exc)
 
