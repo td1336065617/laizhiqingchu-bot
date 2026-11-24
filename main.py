@@ -240,6 +240,12 @@ class StickerPlugin(Star):
                 "表情包数据备份（生成压缩包）",
             )
             self.context.register_web_api(
+                f"/{PLUGIN_NAME}/backup/progress",
+                self._web_backup_progress,
+                ["GET"],
+                "备份进度（供页面轮询）",
+            )
+            self.context.register_web_api(
                 f"/{PLUGIN_NAME}/backups",
                 self._web_backups,
                 ["GET"],
@@ -1243,13 +1249,79 @@ class StickerPlugin(Star):
             raise ValueError(f"保存配置失败：{exc}") from exc
         return updated
 
-    async def _web_backup(self):
-        """生成备份压缩包：data/stickers -> zip（含 index/blocked/manifest 校验清单）。"""
+    def _backup_progress_init(self) -> dict:
+        """初始化一次备份的进度对象（同一次备份里被原地更新）。"""
+        total_files = sum(len(names) for names in self.index.values())
+        return {
+            "state": "running",
+            "percent": 0,
+            "done_files": 0,
+            "total_files": total_files,
+            "done_bytes": 0,
+            "filename": None,
+            "error": None,
+            "started_at": time.time(),
+        }
+
+    def _run_backup_thread(self, progress: dict) -> None:
+        """在线程里跑备份，并把结果写回 progress（异常必须落进 state，不能静默）。"""
         try:
-            info = self._backup_to_zip()
+            info = self._backup_to_zip(progress=progress)
+            progress.update(
+                {
+                    "state": "done",
+                    "percent": 100,
+                    "filename": info["filename"],
+                    "size": info["size"],
+                    "pruned": info.get("pruned", []),
+                }
+            )
+            logger.info(
+                "备份完成：%s（%.1fMB，%d 张，清理旧包 %d 份）",
+                info["filename"],
+                info["size"] / 1048576,
+                info["images"],
+                len(info.get("pruned", [])),
+            )
         except Exception as exc:
             logger.error("备份失败: %s", exc, exc_info=True)
-            return error_response(f"备份失败：{exc}")
+            progress.update({"state": "failed", "error": str(exc)})
+
+    async def _web_backup(self):
+        """受理备份请求：后台线程执行，立刻返回，避免把事件循环卡住。
+
+        原实现直接在 handler 里同步压缩（线上 637MB 约 15s），这期间整个机器人不响应，
+        前端也拿不到任何进度。
+        """
+        state = self.__dict__.get("_backup_state") or {}
+        if state.get("state") == "running":
+            return json_response(
+                {
+                    "status": "running",
+                    "message": (
+                        f"备份中 {state.get('percent', 0)}%"
+                        f"（{state.get('done_files', 0)}/{state.get('total_files', 0)} 个文件）"
+                    ),
+                    "data": state,
+                }
+            )
+
+        progress = self._backup_progress_init()
+        self._backup_state = progress
+        task = asyncio.create_task(asyncio.to_thread(self._run_backup_thread, progress))
+        # 必须持引用：不持引用时 task 可能被 GC，异常也会丢
+        self._backup_task = task
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        return json_response(
+            {
+                "status": "accepted",
+                "message": (
+                    f"备份已开始（{progress['total_files']} 个文件），"
+                    "可在备份列表查看进度"
+                ),
+                "data": progress,
+            }
+        )
         return json_response(
             {
                 "status": "success",
@@ -1286,6 +1358,10 @@ class StickerPlugin(Star):
             logger.error("读取备份列表失败: %s", exc)
             return error_response(f"读取备份列表失败：{exc}")
         return json_response({"status": "success", "data": {"backups": items}})
+
+    async def _web_backup_progress(self):
+        state = self.__dict__.get("_backup_state") or {"state": "idle", "percent": 0}
+        return json_response({"status": "success", "data": state})
 
     async def _web_download(self):
         name = request.query.get("name", "")
@@ -1401,7 +1477,7 @@ class StickerPlugin(Star):
             }
         )
 
-    def _backup_to_zip(self, prefix: str = "sticker_backup") -> dict:
+    def _backup_to_zip(self, prefix: str = "sticker_backup", progress: Optional[dict] = None) -> dict:
         """把当前全部表情包数据打包为 zip（含 manifest 校验清单）。
 
         prefix 用于区分自动备份（sticker_backup_*）与恢复前快照（pre-restore_*）。
@@ -1422,6 +1498,8 @@ class StickerPlugin(Star):
                 "blocked_keywords.json",
                 json.dumps(sorted(self.blocked_keywords), ensure_ascii=False, indent=2),
             )
+            done_since_flush = 0
+            last_flush = time.time()
             for keyword, names in self.index.items():
                 folder = self.data_dir / keyword
                 for fname in names:
@@ -1431,6 +1509,21 @@ class StickerPlugin(Star):
                     arc = f"{keyword}/{fname}"
                     zf.write(fpath, arc)
                     files_meta.append({"path": arc, "md5": self._md5(fpath)})
+                    if progress is not None:
+                        done_since_flush += 1
+                        progress["done_files"] = len(files_meta)
+                        try:
+                            progress["done_bytes"] = progress.get("done_bytes", 0) + fpath.stat().st_size
+                        except OSError:
+                            pass
+                        total = progress.get("total_files") or 0
+                        if total:
+                            progress["percent"] = int(len(files_meta) * 100 / total)
+                        # 每 50 个文件或每 0.5 秒刷一次：回调本身不能成为瓶颈
+                        now = time.time()
+                        if done_since_flush >= 50 or now - last_flush >= 0.5:
+                            done_since_flush = 0
+                            last_flush = now
             zf.writestr(
                 "manifest.json",
                 json.dumps(
