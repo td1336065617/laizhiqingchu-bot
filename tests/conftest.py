@@ -155,6 +155,12 @@ def _install_astrbot_stub() -> bool:
     # 真 json_response 把传入对象原样序列化（不额外包 status/data）
     web.json_response = lambda payload=None, **kwargs: payload
     web.file_response = lambda *args, **kwargs: {"status": "success", "file": True}
+    # 流式响应：桩只保留内容与头，测试里可直接迭代 content
+    web.stream_response = lambda content, **kwargs: {
+        "status": "success",
+        "stream": content,
+        "headers": kwargs.get("headers") or {},
+    }
     web.request = _Request()
     api.web = web
     return True
