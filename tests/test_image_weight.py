@@ -74,14 +74,14 @@ def test_zero_weight_never_sent(tmp_path):
     bot._store.close()
 
 
-def test_all_zero_falls_back_to_uniform(tmp_path):
+def test_all_zero_means_nothing_sendable(tmp_path):
+    """0 = 永不发送：整池都是 0 时应当"无可发送图片"，不能硬发一张。"""
     main, bot = _bot(tmp_path)
     for name in ("0.jpg", "1.jpg", "2.jpg"):
         bot._store.set_weight("清楚", name, 0)
 
-    picks = {bot._pick_from_pool("清楚")[1] for _ in range(200)}
-
-    assert len(picks) > 1, "全零时必须退回均匀，而不是发不出图"
+    assert bot._pick_from_pool("清楚") is None
+    assert bot._pool_weights("清楚") == ([], [])
     bot._store.close()
 
 

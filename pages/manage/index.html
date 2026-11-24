@@ -242,7 +242,7 @@
     <span id="dlText" class="muted">准备中…</span>
   </div>
   <div id="dlBar"><div id="dlFill"></div></div>
-  <div class="dl-note">浏览器不会提供下载进度，这里显示服务器已发送的数据量</div>
+  <div class="dl-note">浏览器不提供下载进度；这里显示服务器已发出的数据量（可能略快于实际落盘）</div>
 </div>
 
 <div class="card">
@@ -446,9 +446,9 @@
       '，共 ' + files + ' 张；备份另占 ' + backups.toFixed(1) + ' MB / ' + Number(usage.backup_count || 0) + ' 份';
     const fill = document.getElementById('usageFill');
     fill.style.width = (limit > 0 ? pct : 0) + '%';
-    fill.style.background = (limit > 0 && used >= limit) ? '#dc2626' : (pct >= 80 ? '#f59e0b' : '#22c55e');
+    fill.style.background = (limit > 0 && used > limit) ? '#dc2626' : (pct >= 80 ? '#f59e0b' : '#22c55e');
     const hint = document.getElementById('usageHint');
-    if (limit > 0 && used >= limit) {
+    if (limit > 0 && used > limit) {
       hint.style.color = '#dc2626';
       hint.textContent = '⚠️ 已超过上限：新增图片会被拒绝。请先删除部分关键词，或调高「存储上限」。';
     } else if (pct >= 80) {
@@ -518,56 +518,27 @@
       show('该备份 ' + fmtSize(item.size) + '，下载需保持网络稳定；中断需从头再来（可改用按关键词导出）', true);
     }
 
-    // 优先：页面自己 fetch 同一地址，读到的是「真实接收字节」
-    let target = null;
-    try {
-      const info = await A.apiGet('backup/download/url', { name: item.filename });
-      target = info && info.url ? info.url : null;
-    } catch (e) {
-      target = null;
-    }
-
-    if (target && typeof fetch === 'function' && window.ReadableStream) {
-      const token = localStorage.getItem('token') || sessionStorage.getItem('token');
-      try {
-        const resp = await fetch(target, {
-          headers: token ? { Authorization: 'Bearer ' + token } : {},
-          cache: 'no-store',
-        });
-        if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        const total = Number(resp.headers.get('content-length') || item.size || 0);
-        if (resp.body && resp.body.getReader) {
-          const reader = resp.body.getReader();
-          const chunks = [];
-          let received = 0;
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-            received += value.byteLength;
-            dlRender(refs, 'downloading', received, total, startedAt);
-          }
-          dlRender(refs, 'done', received, total, startedAt);
-          saveBlob(chunks, item.filename);
-          setTimeout(() => { refs.panel.style.display = 'none'; }, 3000);
-          return;
-        }
-      } catch (e) {
-        // 拿不到流（鉴权/跨域/中断）就回退到桥接下载 + 服务端进度
-        console.warn('直连下载失败，回退桥接：', e);
-      }
-    }
-
-    // 回退：宿主桥接下载（无进度回调），改看服务端已发送量
+    // 浏览器不给下载进度：桥接下载 + 轮询服务端已发送量（口径写在面板里）
     A.download('backup/download', { name: item.filename }, item.filename);
+    let idleTicks = 0;
     for (let i = 0; i < 12000; i += 1) {
       await new Promise((r) => setTimeout(r, 300));
       let st = {};
       try {
-        st = (await A.apiGet('backup/download/progress')) || {};
+        st = (await A.apiGet('backup/download/progress', { name: item.filename })) || {};
       } catch (e) {
+        st = {};
+      }
+      if (st.state === 'idle') {
+        idleTicks += 1;
+        if (idleTicks > 20) {           // 服务端没开始发（例如文件已删）就别空转
+          refs.title.textContent = '下载未开始';
+          refs.text.textContent = '服务端没有收到这次下载请求，请重试或看日志';
+          break;
+        }
         continue;
       }
+      idleTicks = 0;
       if (st.filename && st.filename !== item.filename) continue;
       const sent = Number(st.sent || 0);
       const total = Number(st.total || item.size || 0);
@@ -755,7 +726,8 @@
     if (!file) { show('请先选择备份压缩包', true); return; }
     try {
       show('正在恢复...');
-      const r = await A.upload('restore', file);
+      await A.apiPost('backup/restore/prepare', { confirm: 'restore' });
+      const r = await A.upload('backup/restore', file);
       show(r && r.message ? r.message : JSON.stringify(r));
       refreshBackups();
     } catch (e) {
@@ -778,7 +750,7 @@
     clearArmed = false;
     btn.textContent = '清空表情包';
     try {
-      const r = await A.apiPost('clear');
+      const r = await A.apiPost('clear', { confirm: 'clear' });
       show((r && r.message) || JSON.stringify(r));
     } catch (e) {
       show('清空失败：' + (e && e.message ? e.message : e), true);

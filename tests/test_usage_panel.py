@@ -24,7 +24,7 @@ def test_page_explains_restore_is_not_limited():
 def test_usage_states_cover_normal_near_and_over():
     text = PAGE.read_text(encoding="utf-8")
     body = text.split("function renderUsage", 1)[1].split("async function", 1)[0]
-    assert "used >= limit" in body, "缺超限分支"
+    assert "used > limit" in body, "超限判定必须与后端 _enforce_storage 一致（严格大于）"
     assert "pct >= 80" in body, "缺接近上限分支"
     assert "新增图片会被拒绝" in body
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -85,8 +86,19 @@ class Store:
         # 单连接多线程写会互相踩，所以再用一把可重入锁串行化写操作。
         self._lock = threading.RLock()
         self.conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        # 两个进程同时首次打开时 PRAGMA journal_mode 会撞 database is locked（实测 6.7%）：
+        # 重试几次；仍失败就沿用默认 journal，不因此拒绝启动。
+        for attempt in range(5):
+            try:
+                self.conn.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 4:
+                    break   # 仍锁着就沿用默认 journal，不因此拒绝启动
+                time.sleep(0.05 * (attempt + 1))
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        # 注意：这里不要再调一次 PRAGMA journal_mode=WAL——上面重试循环已尽力，
+        # 重复调用会让"锁住也照样启动"的承诺失效（终审实测锁 45s 时在此抛出）。
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.execute("PRAGMA foreign_keys=ON")
@@ -99,9 +111,14 @@ class Store:
             row[1] for row in self.conn.execute("PRAGMA table_info(image)")
         }
         if "weight" not in columns:
-            self.conn.execute(
-                "ALTER TABLE image ADD COLUMN weight INTEGER NOT NULL DEFAULT 1"
-            )
+            try:
+                self.conn.execute(
+                    "ALTER TABLE image ADD COLUMN weight INTEGER NOT NULL DEFAULT 1"
+                )
+            except sqlite3.OperationalError as exc:
+                # 另一个进程刚好也在补列：duplicate column 视为"已存在"，继续走
+                if "duplicate column" not in str(exc).lower():
+                    raise
         self.conn.execute("DROP INDEX IF EXISTS ux_image_md5")
         self.conn.execute("CREATE INDEX IF NOT EXISTS ix_image_md5 ON image(md5)")
         # 版本号必须跟着写入：只补列不改版本会让下次误判"还是老库"

@@ -125,9 +125,13 @@ def test_restore_creates_pre_restore_snapshot(tmp_path, monkeypatch):
     async def fake_files():
         return files
 
-    monkeypatch.setattr(main, "request", type("R", (), {"files": staticmethod(fake_files), "json": staticmethod(lambda default=None: {})}))
+    monkeypatch.setattr(main, "request", type("R", (), {"username": "tester", "files": staticmethod(fake_files), "json": staticmethod(lambda default=None: {"confirm": "restore"}), "username": "tester"}))
 
-    response = asyncio.run(bot._web_restore())
+    async def _prepare_then_restore():
+        await bot._web_restore_prepare()
+        return await bot._web_restore()
+
+    response = asyncio.run(_prepare_then_restore())
 
     assert calls, "恢复应被调用"
     assert response.status_code == 200
@@ -152,7 +156,7 @@ def test_restore_aborts_when_snapshot_fails(tmp_path, monkeypatch):
     async def fake_files():
         return {"file": _Upload()}
 
-    monkeypatch.setattr(main, "request", type("R", (), {"files": staticmethod(fake_files), "json": staticmethod(lambda default=None: {})}))
+    monkeypatch.setattr(main, "request", type("R", (), {"username": "tester", "files": staticmethod(fake_files), "json": staticmethod(lambda default=None: {"confirm": "restore"}), "username": "tester"}))
 
     response = asyncio.run(bot._web_restore())
 

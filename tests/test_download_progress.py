@@ -97,43 +97,18 @@ def test_page_shows_download_progress_panel():
     assert "backup/download/progress" in text
     assert "服务器已发送" in text, "要说明进度口径，避免误解为浏览器进度"
 
-def test_download_url_endpoint_builds_absolute_url(tmp_path, monkeypatch):
-    main, bot = _bot(tmp_path)
-    target = bot.backup_root / "sticker_backup_a.zip"
-    target.write_bytes(b"z" * 16)
-
-    class _Req:
-        query = {"name": target.name}
-        base_url = "https://example.com/dashboard/"
-        path = "/sticker_plugin/backup/download/url"
-
-    monkeypatch.setattr(main, "request", _Req)
-    data = body(asyncio.run(bot._web_download_url()))["data"]
-
-    assert data["url"] == "https://example.com/dashboard/sticker_plugin/backup/download?name=sticker_backup_a.zip"
-    assert data["size"] == 16
-
-
-def test_download_url_rejects_missing_and_traversal(tmp_path, monkeypatch):
-    main, bot = _bot(tmp_path)
-
-    class _Req:
-        def __init__(self, name):
-            self.query = {"name": name}
-            self.base_url = "https://example.com/"
-            self.path = "/p/backup/download/url"
-
-    for bad in ("", "../../etc/passwd", "nope.zip"):
-        monkeypatch.setattr(main, "request", _Req(bad))
-        resp = body(asyncio.run(bot._web_download_url()))
-        assert resp.get("status") != "success", bad
-
-
-def test_page_uses_streaming_fetch_with_auth_and_fallback():
+def test_page_does_not_fetch_directly():
+    """框架 iframe 是 sandbox 无 allow-same-origin：localStorage 抛 SecurityError、
+    跨源带 Authorization 过不了预检，所以页面不得自己 fetch 下载地址（审计 S1/S2）。
+    """
     text = PAGE.read_text(encoding="utf-8")
-    assert "backup/download/url" in text
-    assert "getReader" in text, "必须读流才能拿到真实接收字节"
-    assert "Authorization" in text and "Bearer" in text
-    assert "saveBlob" in text
-    assert "A.download" in text, "拿不到流时要回退到桥接下载"
-    assert "真实接收字节" in text
+    assert "localStorage" not in text, "沙箱 iframe 里读 localStorage 会抛 SecurityError"
+    assert "fetch(" not in text, "页面不应直连下载地址"
+    assert "backup/download/url" not in text, "该端点已移除，页面不得再引用"
+    assert "A.download(" in text, "必须走宿主桥接下载"
+
+
+def test_progress_polled_by_filename():
+    text = PAGE.read_text(encoding="utf-8")
+    assert "backup/download/progress" in text
+    assert "name: item.filename" in text, "并发下载时必须按文件名取进度"

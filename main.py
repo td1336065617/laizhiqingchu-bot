@@ -325,12 +325,6 @@ class StickerPlugin(Star):
                 "下载表情包备份压缩包",
             )
             self.context.register_web_api(
-                f"/{PLUGIN_NAME}/backup/download/url",
-                self._web_download_url,
-                ["GET"],
-                "返回下载绝对地址（供页面 fetch，拿真实接收进度）",
-            )
-            self.context.register_web_api(
                 f"/{PLUGIN_NAME}/backup/download/progress",
                 self._web_download_progress,
                 ["GET"],
@@ -779,16 +773,19 @@ class StickerPlugin(Star):
             yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
 
-        files = self._prune_missing(keyword)
-        if not files:
+        # 序号必须与「列表」同一个并集顺序，否则会删掉列表上看不见的那张（审计 S1）
+        for member in self._group_members(keyword):
+            self._prune_missing(member)
+        pairs = self._pool_pairs(keyword)
+        if not pairs:
             yield event.plain_result(f"关键词 {keyword} 下不存在图片")
             return
-        if index < 1 or index > len(files):
-            yield event.plain_result(f"序号无效，该关键词下共 {len(files)} 张图片")
+        if index < 1 or index > len(pairs):
+            yield event.plain_result(f"序号无效，该关键词下共 {len(pairs)} 张图片")
             return
 
-        filename = files[index - 1]
-        target = self.data_dir / keyword / filename
+        member, filename = pairs[index - 1]
+        target = self.data_dir / member / filename
         try:
             if target.exists():
                 target.unlink()
@@ -797,13 +794,14 @@ class StickerPlugin(Star):
             yield event.plain_result(f"删除失败：{exc}")
             return
 
-        files.pop(index - 1)
+        files = [name for name in (self.index.get(member) or []) if name != filename]
         if files:
-            self.index[keyword] = files
+            self.index[member] = files
         else:
-            self.index.pop(keyword, None)
+            self.index.pop(member, None)
+            # 只有"这个关键词一张都不剩"时才收缩绑定关系（审计 M4）
+            self._drop_alias_group(member)
         self._save_index()
-        self._drop_alias_group(keyword)
         yield event.plain_result(f"已删除第 {index} 张图片：{filename}")
 
     async def _delete_by_md5(
@@ -955,6 +953,7 @@ class StickerPlugin(Star):
                 return
             self.index.pop(keyword, None)
             self._save_index()
+            self._drop_alias_group(keyword)
             yield event.plain_result(f"已删除关键词 {keyword} 的全部图片")
             return
 
@@ -1109,9 +1108,8 @@ class StickerPlugin(Star):
         keyword = resolved or keyword  # 未知关键词保留原值，交给下游给候选提示
         if not keyword:
             return ai_common.fail("invalid_argument", "缺少 keyword（表情包关键词）", field="keyword")
-        reason = ai_impl.block_reason(keyword, self.blocked_keywords)
-        if reason:
-            # 设计 §7.2：屏蔽关键词按 disabled 回报（便于 AI 区分"功能被关"与"关键词被屏蔽"）
+        if self._is_blocked(keyword):
+            # 整池判断：屏蔽池内任一成员，AI 也不能通过其它成员绕过（审计 S3）
             return ai_common.fail("disabled", "该关键词不可用", keyword=keyword)
         if len(keyword) > ai_impl.KEYWORD_MAX_LEN:
             return ai_common.fail(
@@ -1121,7 +1119,11 @@ class StickerPlugin(Star):
             )
         if not self._is_valid_keyword(keyword):
             return ai_common.fail("invalid_argument", "关键词不合法（保留名/结尾点号等）", field="keyword")
-        files = self._read_index_files(keyword)
+        files = [
+            name
+            for member, name in self._pool_pairs(keyword)
+            if (self.data_dir / member / name).is_file()
+        ] or self._read_index_files(keyword)
         if not files:
             hint = ai_impl.keyword_hint(self.index, keyword)
             return ai_common.fail(
@@ -1205,9 +1207,8 @@ class StickerPlugin(Star):
         keyword = resolved or keyword  # 未知关键词保留原值，交给下游给候选提示
         if not keyword:
             return ai_common.fail("invalid_argument", "缺少 keyword（表情包关键词）", field="keyword")
-        reason = ai_impl.block_reason(keyword, self.blocked_keywords)
-        if reason:
-            return ai_common.fail("disabled", reason, field="keyword")   # 与 sticker_send 统一：屏蔽按「功能被关」回报
+        if self._is_blocked(keyword):
+            return ai_common.fail("disabled", "该关键词不可用", field="keyword")   # 与 sticker_send 统一：整池判断报
         if len(keyword) > ai_impl.KEYWORD_MAX_LEN:
             return ai_common.fail(
                 "invalid_argument",
@@ -1642,6 +1643,9 @@ class StickerPlugin(Star):
             "state": "downloading",
             "started_at": time.time(),
         }
+        states = self.__dict__.get("_download_states") or {}
+        states[target.name] = state
+        self._download_states = states
         self._download_state = state
 
         quoted = quote(target.name)
@@ -1678,47 +1682,29 @@ class StickerPlugin(Star):
                         last_flush = now
                     yield chunk
             state.update({"sent": sent, "percent": 100, "state": "done"})
-        except Exception as exc:  # 客户端断开也会走到这里
+        except (GeneratorExit, asyncio.CancelledError) as exc:
+            # 客户端断开：GeneratorExit/CancelledError 不是 Exception 子类，必须单独捕
+            state.update({"state": "aborted", "error": type(exc).__name__})
+            logger.info("下载中断（%s）：%s", target.name, type(exc).__name__)
+            raise
+        except Exception as exc:
             state.update({"state": "aborted", "error": str(exc)})
-            logger.info("下载中断（%s）：%s", target.name, exc)
+            logger.info("下载失败（%s）：%s", target.name, exc)
         finally:
+            if state.get("state") == "downloading":
+                state.update({"state": "aborted", "error": "closed"})
             state["finished_at"] = time.time()
 
-    async def _web_download_url(self):
-        """返回下载端点的绝对 URL，供页面自己 fetch（浏览器原生进度 / 真实接收字节）。
-
-        页面拿不到插件 API 的基址（由宿主拼装），所以由服务端按当前请求反推：
-        base_url + 当前路径去掉尾部 /url。
-        """
-        name = request.query.get("name", "")
-        target = (self.backup_root / Path(name).name).resolve()
-        if (
-            not name
-            or target.parent != self.backup_root.resolve()
-            or not target.is_file()
-            or target.suffix != ".zip"
-        ):
-            return error_response("备份文件不存在")
-        try:
-            base = str(request.base_url).rstrip("/")
-            path = str(request.path).removesuffix("/url")
-            url = f"{base}{path}?name={quote(target.name)}"
-        except Exception as exc:
-            logger.warning("构造下载 URL 失败: %s", exc)
-            return error_response("无法构造下载地址")
-        return json_response(
-            {
-                "status": "success",
-                "data": {
-                    "url": url,
-                    "filename": target.name,
-                    "size": target.stat().st_size,
-                },
-            }
-        )
-
     async def _web_download_progress(self):
-        state = self.__dict__.get("_download_state") or {"state": "idle", "percent": 0}
+        try:
+            query = request.query or {}
+        except Exception:      # 非 handler 上下文（测试/内部调用）没有 request
+            query = {}
+        name = query.get("name", "") if hasattr(query, "get") else ""
+        states = self.__dict__.get("_download_states") or {}
+        state = states.get(Path(name).name) if name else self.__dict__.get("_download_state")
+        if not state:
+            state = {"state": "idle", "percent": 0}
         return json_response({"status": "success", "data": state})
 
     async def _web_backup_delete(self):
@@ -1753,7 +1739,42 @@ class StickerPlugin(Star):
             }
         )
 
+    async def _web_restore_prepare(self):
+        """恢复前的一次性确认（页面在用户点击后调用）。"""
+        try:
+            who = str(getattr(request, "username", "") or "")
+        except Exception:
+            who = ""
+        if not who:
+            return error_response("无法识别当前登录用户")
+        states = self.__dict__.get("_restore_ready") or {}
+        states[who] = time.time()
+        self._restore_ready = states
+        return json_response({"status": "success", "data": {"expires_in": 120}})
+
+    async def _request_payload(self):
+        """取 JSON 体：真实框架是 async，测试桩可能是同步函数。"""
+        try:
+            payload = request.json(default=None)
+        except TypeError:
+            try:
+                payload = request.json()
+            except Exception:
+                return None
+        except Exception:
+            return None
+        if asyncio.iscoroutine(payload):
+            payload = await payload
+        return payload if isinstance(payload, dict) else None
+
     async def _web_restore(self):
+        # 上传是 multipart，带不了 JSON 令牌：要求同一 dashboard 用户先调用
+        # restore/prepare（页面在点击确认后立刻调），120 秒内有效且一次性。
+        who = str(getattr(request, "username", "") or "")
+        ready = (self.__dict__.get("_restore_ready") or {}).get(who, 0)
+        if not who or time.time() - ready > 120:
+            return error_response("恢复未被确认：请先在管理页点击「上传并恢复」完成确认")
+        self._restore_ready.pop(who, None)
         files = await request.files()
         upload = files.get("file")
         if upload is None:
@@ -1775,7 +1796,7 @@ class StickerPlugin(Star):
             except Exception as exc:
                 logger.error("恢复前备份失败，已中止恢复: %s", exc, exc_info=True)
                 return error_response(f"恢复已中止：恢复前备份失败（{exc}）")
-            stats = self._restore_from_zip(tmp_path)
+            stats = await asyncio.to_thread(self._restore_from_zip, tmp_path)
         except Exception as exc:
             logger.error("恢复备份失败: %s", exc, exc_info=True)
             return error_response(f"恢复失败：{exc}")
@@ -1789,6 +1810,11 @@ class StickerPlugin(Star):
 
     async def _web_clear(self):
         """清空全部表情包数据（删除所有关键词目录与索引，不影响管理员/屏蔽列表）。"""
+        payload = await self._request_payload()
+        # 注意：必须是"没给令牌就拒绝"，不能只在给了字典时校验——
+        # 页面空 body 发 A.apiPost('clear') 时 payload 是 None，旧写法直接放行（审计 S-A）
+        if not isinstance(payload, dict) or str(payload.get("confirm") or "") != "clear":
+            return error_response("清空不可恢复，需要二次确认（confirm=clear）")
         try:
             cleared_keywords = len(self.index)
             cleared_images = sum(
@@ -1796,11 +1822,22 @@ class StickerPlugin(Star):
                 for names in self.index.values()
                 if isinstance(names, list)
             )
-            for child in list(self.data_dir.iterdir()):
-                if child.is_dir():
-                    shutil.rmtree(child)
+
+            def _wipe() -> None:
+                for child in list(self.data_dir.iterdir()):
+                    if child.is_dir():
+                        shutil.rmtree(child)
+
+            await asyncio.to_thread(_wipe)
             self.index.clear()
             self.pending_delete.clear()
+            # 清空图库后绑定关系没有意义，留着会变成幽灵组（审计 ⑧）
+            self.alias_groups = {}
+            self._refresh_alias_map()
+            try:
+                self._save_groups()
+            except OSError as exc:
+                logger.warning("清空绑定表失败: %s", exc)
             self._save_index()
         except Exception as exc:
             logger.error("清空表情包失败: %s", exc, exc_info=True)
@@ -1880,10 +1917,10 @@ class StickerPlugin(Star):
             # 别名表：只导单个关键词时也带上它的组，恢复后别名不丢
             groups = self.__dict__.get("alias_groups") or {}
             if only_keyword:
+                # 用一个池成员导出时，包内应带上它所在的整个组（审计 ⑩）
+                group_name = (getattr(self, "alias_map", None) or {}).get(only_keyword) or only_keyword
                 groups = (
-                    {only_keyword: groups[only_keyword]}
-                    if only_keyword in groups
-                    else {}
+                    {group_name: groups[group_name]} if group_name in groups else {}
                 )
             # 权重（存在 SQLite 里，导出成 JSON 才能跟包走）
             store = self.__dict__.get("_store")
@@ -2218,12 +2255,17 @@ class StickerPlugin(Star):
 
             # 别名表：v2 包才可能有；缺失视为"无别名"，不影响 v1 恢复
             weights_applied = 0
+            weights_skipped = False
             if "weights.json" in members and self.__dict__.get("_store") is not None:
                 try:
                     payload = json.loads(zf.read("weights.json").decode("utf-8"))
-                    weights_applied = self._store.import_weights(payload.get("weights") or {})
-                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                    logger.warning("备份里的 weights.json 无法解析，已跳过：%s", exc)
+                    raw_weights = payload.get("weights") if isinstance(payload, dict) else None
+                    if not isinstance(raw_weights, dict):
+                        raise ValueError("weights 字段必须是对象")
+                    weights_applied = self._store.import_weights(raw_weights)
+                except Exception as exc:   # 任何畸形都只跳过权重，不推翻已完成的图片恢复
+                    weights_skipped = True
+                    logger.warning("备份里的 weights.json 无效，已跳过：%s", exc)
 
             aliases_merged = 0
             if "aliases.json" in members:
@@ -2238,6 +2280,7 @@ class StickerPlugin(Star):
             "archive_keywords": len(archive_index),
             "aliases_merged": aliases_merged,
             "weights_applied": weights_applied,
+            "weights_skipped": weights_skipped,
             "archive_images": archive_images,
             "added": added,
             "skipped": skipped,
@@ -2333,7 +2376,7 @@ class StickerPlugin(Star):
             yield event.plain_result("当前是纯 JSON 存储模式，权重不可用")
             return
         members = self._group_members(keyword) if keyword else list(self.index)
-        if keyword and not members:
+        if keyword and keyword not in self.index and not members:
             yield event.plain_result(f"关键词 {keyword} 不存在")
             return
         lines = []
@@ -2342,14 +2385,17 @@ class StickerPlugin(Star):
                 mapping = self._store.weights_of(member)
             except Exception:
                 continue
+            # 不能用 w or 1：0 是合法值（永不发送），会被 or 吞成 1（审计 S1）
             rows = sorted(
-                (name, w) for name, w in mapping.items() if int(w or 1) != 1
+                (name, int(w)) for name, w in mapping.items() if int(w) != 1
             )
             if not rows:
                 continue
             lines.append(f"[{member}]")
             for name, w in rows[:20]:
                 lines.append(f"  {name} → {w}" + ("（永不发送）" if int(w) == 0 else ""))
+            if len(rows) > 20:
+                lines.append(f"  …另有 {len(rows) - 20} 条未显示")
         if not lines:
             yield event.plain_result("没有非默认权重的图片（默认权重都是 1）")
             return
@@ -2777,8 +2823,12 @@ class StickerPlugin(Star):
         target_group = self._group_of(primary) or primary
         target_members = self._group_members_full(target_group)
         if target_group not in self.index:
-            yield event.plain_result(f"{primary} 下不存在图片，请先添加")
-            return
+            alive = [m for m in target_members if m in self.index]
+            if not alive:
+                yield event.plain_result(f"{primary} 下不存在图片，请先添加")
+                return
+            target_group = alive[0]
+            target_members = self._group_members_full(target_group)
         if alias in target_members:
             yield event.plain_result(f"{alias} 已经在 {target_group} 的图池里")
             return
@@ -2786,8 +2836,10 @@ class StickerPlugin(Star):
         snapshot = {k: list(v) for k, v in self.alias_groups.items()}
         # A 若已在别的池子里：整池（含它的兄弟关键词）一起并进来，
         # 否则单绑 A 会把兄弟留在孤儿组里（第一版就踩了这个坑）。
+        # A 可能只是组员而不是组名：必须按它所在组取整池（审计 S2）
+        source_group = self._group_of(alias)
         alias_members = (
-            self._group_members_full(alias) if alias in self.alias_groups else [alias]
+            self._group_members_full(source_group) if source_group else [alias]
         )
         for member in alias_members:
             if member not in target_members:
@@ -3214,6 +3266,16 @@ class StickerPlugin(Star):
         except OSError:
             return digest, None, Path(filename).suffix.lower()
 
+    @staticmethod
+    def _note_sqlite_race(exc: Exception) -> None:
+        """把「并发竞态」与「真的配置错了」区分开，避免用户被误导。"""
+        text = str(exc).lower()
+        if any(key in text for key in ("locked", "duplicate column", "busy")):
+            logger.warning(
+                "这是并发打开数据库的竞态（不是配置问题）：另一实例可能正在迁移，"
+                "本次以纯 JSON 运行，权重功能暂不可用；重启一次即可恢复"
+            )
+
     def _init_storage(self) -> None:
         """建立 SQLite 存储（失败或 STICKER_STORAGE=json 时保持纯 JSON）。"""
         if _store_mod.storage_mode() == "json":
@@ -3223,6 +3285,7 @@ class StickerPlugin(Star):
             store = _store_mod.Store(self.db_path)
         except Exception as exc:
             logger.error("打开 SQLite 失败，回落纯 JSON：%s", exc)
+            self._note_sqlite_race(exc)
             return
         self._store = store
         try:
@@ -3274,6 +3337,7 @@ class StickerPlugin(Star):
                     )
         except Exception as exc:
             logger.error("SQLite 初始化失败，回落纯 JSON：%s", exc)
+            self._note_sqlite_race(exc)
             try:
                 # 迁移/校验失败会留下半份数据：清空内容并打标记，避免下次启动信它
                 store.clear_content()
@@ -3319,13 +3383,17 @@ class StickerPlugin(Star):
                             text = str(item).strip()
                             if text and text not in members:
                                 members.append(text)
-                        if primary and primary not in members:
+                        # v3 的成员表是完整的：组键不在成员里说明它是历史残留，
+                        # 不能再插回去，否则删掉的成员会"复活"（审计 M4）
+                        if primary and primary not in members and not isinstance(payload, list):
                             members.insert(0, primary)
                         if len(members) >= 2:
                             self.alias_groups[primary] = members
         except (json.JSONDecodeError, OSError) as exc:
             logger.error("读取关键词绑定表失败（按未绑定处理）: %s", exc)
         self._refresh_alias_map()
+        # 基线：区分"别的实例新增的组"和"我自己删掉的组"，否则合并会把删掉的又救回来
+        self._groups_baseline = {k: list(v) for k, v in self.alias_groups.items()}
 
     def _refresh_alias_map(self) -> None:
         """重建 关键词→组 的映射（组名取首个成员，保证稳定）。"""
@@ -3340,28 +3408,60 @@ class StickerPlugin(Star):
     def _drop_alias_group(self, keyword: str) -> None:
         """关键词被删除时从所属组里摘掉它；组不足 2 人则解散。"""
         groups = self.__dict__.get("alias_groups") or {}
+        snapshot = {k: list(v) for k, v in groups.items()}
         primary = self.alias_map.get(keyword)
         changed = False
-        if primary and primary in groups:
-            groups[primary] = [m for m in groups[primary] if m != keyword]
-            if len(groups[primary]) < 2:
-                groups.pop(primary, None)
+        targets = {primary} if primary else set()
+        targets |= {name for name in groups if keyword in groups[name]}
+        for name in targets:
+            if name not in groups:
+                continue
+            left = [m for m in groups[name] if m != keyword]
+            groups.pop(name, None)
+            if len(left) >= 2:
+                # 组名取剩余第一个成员，避免出现"组名不在成员里"的幽灵组（审计 M4）
+                groups[left[0]] = left
             changed = True
-        for name in list(groups):
-            if keyword in groups[name]:
-                groups[name] = [m for m in groups[name] if m != keyword]
-                if len(groups[name]) < 2:
-                    groups.pop(name, None)
-                changed = True
         if not changed:
             return
         self._refresh_alias_map()
         try:
             self._save_groups()
         except OSError as exc:
-            logger.warning("清理关键词绑定失败（%s）: %s", keyword, exc)
+            # 与绑定/解绑一致：失败必须回滚内存，否则重启后行为反向（审计 S9）
+            self.alias_groups = snapshot
+            self._refresh_alias_map()
+            logger.warning("清理关键词绑定失败（%s），已回滚: %s", keyword, exc)
 
     def _save_groups(self) -> None:
+        # 读-改-写：两个实例各改一次时，后写者把磁盘上已存在的组合并进来，
+        # 避免静默丢掉对方刚写的绑定（审计 M7）
+        try:
+            if self.alias_path.exists():
+                disk = json.loads(self.alias_path.read_text(encoding="utf-8"))
+                disk_groups = (disk or {}).get("groups") if isinstance(disk, dict) else None
+                if isinstance(disk_groups, dict):
+                    baseline = self.__dict__.get("_groups_baseline") or {}
+                    for name, members in disk_groups.items():
+                        name = str(name)
+                        if name in self.alias_groups or name in baseline:
+                            # 已知的组（包括我刚删掉的）不参与合并，避免把删除救回来
+                            continue
+                        if isinstance(members, list):
+                            merged = [str(m) for m in members if str(m).strip()]
+                        elif isinstance(members, dict):
+                            merged = [
+                                str(m)
+                                for m in (members.get("members") or members.get("aliases") or [])
+                                if str(m).strip()
+                            ]
+                        else:
+                            continue
+                        if len(merged) >= 2 and not set(merged) & set(self.alias_map):
+                            self.alias_groups[name] = merged
+                    self._refresh_alias_map()
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.debug("保存绑定表前合并磁盘内容失败（忽略）：%s", exc)
         payload = {
             "version": 3,
             "groups": {
@@ -3370,6 +3470,7 @@ class StickerPlugin(Star):
             },
         }
         _atomic_write_json(self.alias_path, payload)
+        self._groups_baseline = {k: list(v) for k, v in self.alias_groups.items()}
 
     def _group_members(self, keyword: str) -> list:
         """该关键词所在图池的成员（含自身），只保留索引里真实存在的。
@@ -3395,11 +3496,19 @@ class StickerPlugin(Star):
         return resolved or [keyword]
 
     def _pool_pairs(self, keyword: str) -> list:
-        """图池里的 (关键词, 文件名)，顺序稳定，列表与按序号删图共用。"""
+        """图池里的 (关键词, 文件名)，顺序稳定，列表/删图/发送/导出共用。
+
+        这里是所有读取的唯一入口，所以路径穿越防护放在这里：索引里的文件名
+        只要带分隔符或 .. 就一律跳过（否则 来只/删图/AI 工具都会被索引内容带出数据目录）。
+        """
         pairs = []
         for member in self._group_members(keyword):
             for name in self.index.get(member) or []:
-                pairs.append((member, name))
+                text = str(name)
+                if not text or text in (".", "..") or "/" in text or "\\" in text:
+                    logger.warning("索引里有非法文件名，已跳过：%s/%s", member, name)
+                    continue
+                pairs.append((member, text))
         return pairs
 
     def _weight_of(self, keyword: str, filename: str) -> int:
@@ -3424,8 +3533,9 @@ class StickerPlugin(Star):
             return [], []
         weights = [self._weight_of(member, name) for member, name in pairs]
         if sum(weights) <= 0:
-            logger.info("关键词 %s 的图池权重全为 0，退回均匀抽取", keyword)
-            weights = [1] * len(pairs)
+            # 权重 0 的语义就是"永不发送"：整池都是 0 时不该硬发一张（审计 M3）
+            logger.info("关键词 %s 的图池权重全为 0，视为无可发送图片", keyword)
+            return [], []
         return pairs, weights
 
     def _pick_from_pool(self, keyword: str):
