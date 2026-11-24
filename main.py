@@ -148,9 +148,9 @@ MENU_TEXT = "\n".join(
         "• 删图{关键词}{序号} ─ 按序号删除单张",
         "• 删除{关键词} ─ 二次确认后删除整个关键词",
         "• 统计 ─ 关键词数 / 图片总数 / Top3",
-        "• 绑定{别名}到{主词} ─ 让别名与主词共用一个图池",
-        "• 解绑{别名} ─ 解除别名绑定",
-        "• 别名{关键词} ─ 查看别名组（不填参数则看全部）",
+        "• 绑定{关键词A}到{关键词B} ─ 两个关键词共用一个图池（图片并集，磁盘不动）",
+        "• 解绑{关键词} ─ 从图池里摘掉它，其它成员照旧",
+        "• 别名{关键词} ─ 查看图池成员（不填参数则看全部）",
         "• 授予管理员 ─ @某人 后发本条，或 授予管理员{ID}",
         "• 撤销管理员 ─ @某人 后发本条，或 撤销管理员{ID}",
         "• 管理员列表 ─ 查看管理员（ID 已脱敏）",
@@ -497,10 +497,9 @@ class StickerPlugin(Star):
         if not raw_keyword:
             yield event.plain_result("用法：添加{关键词}（请回复包含图片的消息）")
             return
-        # 别名命中就落到主词；未命中保留原文——添加本来就可以新建关键词
-        keyword, _how = self._resolve_keyword(raw_keyword)
-        if not keyword:
-            keyword = raw_keyword
+        # 命中已有绑定就落到该图池的主词；未命中保留原文（添加本就能新建关键词）
+        resolved, _how = self._resolve_keyword(raw_keyword)
+        keyword = self._write_target(resolved) if resolved else raw_keyword
         if not self._is_valid_keyword(keyword):
             yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
@@ -680,22 +679,22 @@ class StickerPlugin(Star):
         if not self._is_valid_keyword(keyword):
             yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
-        if keyword in self.blocked_keywords:
+        if self._is_blocked(keyword):
             yield event.plain_result(f"关键词 {keyword} 已被屏蔽，无法发送")
             return
 
-        # 自修复：索引中存在但文件已丢失的条目自动清理
-        files = self._prune_missing(keyword)
-        if not files:
+        # 图池：绑定过的关键词共用一个池子，从并集里随机抽
+        pairs = self._pool_pairs(keyword)
+        pairs = [
+            (member, name)
+            for member, name in pairs
+            if (self.data_dir / member / name).is_file()
+        ]
+        if not pairs:
             yield event.plain_result(f"关键词 {keyword} 下还不存在图片")
             return
-
-        filename = ai_impl.pick_sticker(files)   # 与 AI 工具同源
-        if not filename:
-            yield event.plain_result("关键词 %s 下还不存在图片" % keyword)
-            return
-        image_path = (self.data_dir / keyword / filename).resolve()
-        yield event.image_result(str(image_path))
+        member, filename = random.choice(pairs)
+        yield event.image_result(str((self.data_dir / member / filename).resolve()))
 
     # ------------------------------------------------------------------
     # C. 列表（仅管理员，分页）
@@ -714,11 +713,15 @@ class StickerPlugin(Star):
         if not self._is_valid_keyword(keyword):
             yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
-        if keyword in self.blocked_keywords:
+        if self._is_blocked(keyword):
             yield event.plain_result(f"关键词 {keyword} 已被屏蔽")
             return
 
-        files = self._prune_missing(keyword)
+        files = [
+            name
+            for member, name in self._pool_pairs(keyword)
+            if (self.data_dir / member / name).is_file()
+        ]
         if not files:
             yield event.plain_result("该关键词下没有图片")
             return
@@ -1874,10 +1877,10 @@ class StickerPlugin(Star):
                 "aliases.json",
                 json.dumps(
                     {
-                        "version": 1,
+                        "version": 3,
                         "groups": {
-                            primary: {"primary": primary, "aliases": list(aliases)}
-                            for primary, aliases in groups.items()
+                            primary: list(members)
+                            for primary, members in groups.items()
                         },
                     },
                     ensure_ascii=False,
@@ -2043,26 +2046,34 @@ class StickerPlugin(Star):
         known = set(self.index) | set(restored_keywords)
         for primary, payload in groups.items():
             primary = str(primary)
-            if primary not in known:
-                logger.warning("备份里的别名组主词 %s 不存在，跳过", primary)
-                continue
-            aliases = []
             if isinstance(payload, dict):
-                aliases = [str(a).strip() for a in (payload.get("aliases") or [])]
+                candidates = payload.get("members") or payload.get("aliases") or []
             elif isinstance(payload, list):
-                aliases = [str(a).strip() for a in payload]
-            bucket = self.alias_groups.setdefault(primary, [])
-            for alias in aliases:
-                if not alias or alias == primary or alias in self.index:
+                candidates = payload
+            else:
+                continue
+            members = []
+            for item in candidates:
+                text = str(item).strip()
+                if text and text not in members:
+                    members.append(text)
+            if primary not in members:
+                members.insert(0, primary)
+            # 不要求成员当前就有图片：图被删了绑定关系也该留着，
+            # 读取时 _group_members 会按索引过滤（P2 审计 11 的延伸）。
+            if len(members) < 2:
+                continue
+            primary = members[0]
+            bucket = self.alias_groups.setdefault(primary, [primary])
+            for member in members:
+                if member in bucket:
                     continue
-                owner = self.alias_map.get(alias)
+                owner = self.alias_map.get(member)
                 if owner and owner != primary:
-                    # 本机已有归属：保留本地，不静默改绑（P2 审计 11）
                     conflicts += 1
                     continue
-                if alias not in bucket:
-                    bucket.append(alias)
-                    merged += 1
+                bucket.append(member)
+                merged += 1
         self._refresh_alias_map()
         if merged:
             try:
@@ -2573,90 +2584,113 @@ class StickerPlugin(Star):
         return result
 
     # ---------------- 别名组指令 ----------------
+    def _group_of(self, keyword: str) -> str:
+        return (getattr(self, "alias_map", None) or {}).get(keyword) or ""
+
+    def _group_members_full(self, group: str) -> list:
+        members = list(self.alias_groups.get(group) or [])
+        if group not in members:
+            members.insert(0, group)
+        return members
+
     async def _handle_bind(self, event: AstrMessageEvent, message_str: str):
-        """绑定{别名}到{主词}：单层多对一，别名不得当组名。"""
+        """绑定{关键词A}到{关键词B}：把 A 并进 B 所在的图池（并集）。
+
+        A、B 都可以是真实关键词；A 也可以是纯别名（不在索引里）。
+        """
         if not self._is_admin(event):
             yield event.plain_result("此指令仅限管理员")
             return
         payload = message_str[len("绑定") :].strip()
         if "到" not in payload:
-            yield event.plain_result("用法：绑定{别名}到{主词}")
+            yield event.plain_result("用法：绑定{关键词A}到{关键词B}")
             return
         alias, primary = (part.strip() for part in payload.split("到", 1))
         if not alias or not primary:
-            yield event.plain_result("用法：绑定{别名}到{主词}")
+            yield event.plain_result("用法：绑定{关键词A}到{关键词B}")
             return
         if alias == primary:
-            yield event.plain_result("别名与主词相同，无需绑定")
+            yield event.plain_result("同一个关键词，无需绑定")
             return
         if not self._is_valid_keyword(alias) or not self._is_valid_keyword(primary):
             yield event.plain_result(
                 "关键词不合法（不能是保留指令名、Windows 保留名，结尾也不能带点或空格）"
             )
             return
-        if primary in self.alias_map:
-            yield event.plain_result(
-                f"{primary} 本身是 {self.alias_map[primary]} 的别名，别名不能再作为主词"
-            )
+
+        # 目标组：主词若本身是别的组成员，跟随到那个组
+        target_group = self._group_of(primary) or primary
+        target_members = self._group_members_full(target_group)
+        if target_group not in self.index:
+            yield event.plain_result(f"{primary} 下不存在图片，请先添加")
             return
-        if primary not in self.index:
-            yield event.plain_result(f"主词 {primary} 下不存在图片，请先添加")
+        if alias in target_members:
+            yield event.plain_result(f"{alias} 已经在 {target_group} 的图池里")
             return
-        if alias in self.index:
-            yield event.plain_result(f"{alias} 已经是真实关键词，别名不能与它同名")
-            return
-        if alias in self.alias_map:
-            current = self.alias_map[alias]
-            if current == primary:
-                yield event.plain_result(f"{alias} 已经绑定到 {primary}")
-                return
-            yield event.plain_result(
-                f"{alias} 已绑定到 {current}，请先执行 解绑{alias}"
-            )
-            return
+
         snapshot = {k: list(v) for k, v in self.alias_groups.items()}
-        self.alias_groups.setdefault(primary, [])
-        if alias not in self.alias_groups[primary]:
-            self.alias_groups[primary].append(alias)
+        # A 若已在别的池子里：整池（含它的兄弟关键词）一起并进来，
+        # 否则单绑 A 会把兄弟留在孤儿组里（第一版就踩了这个坑）。
+        alias_members = (
+            self._group_members_full(alias) if alias in self.alias_groups else [alias]
+        )
+        for member in alias_members:
+            if member not in target_members:
+                target_members.append(member)
+        # 清掉所有已被吸收的旧组键，避免一个成员同时挂在两个组
+        absorbed = set(target_members)
+        for name in list(self.alias_groups):
+            if name == target_group:
+                continue
+            if name in absorbed or absorbed & set(self.alias_groups[name]):
+                self.alias_groups.pop(name, None)
+        self.alias_groups[target_group] = target_members
         self._refresh_alias_map()
         try:
             self._save_groups()
         except OSError as exc:
             self.alias_groups = snapshot
             self._refresh_alias_map()
-            logger.error("保存别名表失败: %s", exc)
-            yield event.plain_result(f"保存别名失败：{exc}")
+            logger.error("保存关键词绑定失败: %s", exc)
+            yield event.plain_result(f"保存绑定失败：{exc}")
             return
-        yield event.plain_result(f"已绑定：{alias} → {primary}（来只{alias} 等同 来只{primary}）")
+        yield event.plain_result(
+            f"已绑定：{alias} 并入 {target_group} 的图池"
+            f"（来只{target_group} 与 来只{alias} 抽同一个池子）"
+        )
 
     async def _handle_unbind(self, event: AstrMessageEvent, message_str: str):
+        """解绑{关键词}：只从组里摘掉它，其它成员的绑定关系不受影响。"""
         if not self._is_admin(event):
             yield event.plain_result("此指令仅限管理员")
             return
-        alias = message_str[len("解绑") :].strip()
-        if not alias:
-            yield event.plain_result("用法：解绑{别名}")
+        word = message_str[len("解绑") :].strip()
+        if not word:
+            yield event.plain_result("用法：解绑{关键词}")
             return
-        primary = self.alias_map.get(alias)
-        if not primary:
-            yield event.plain_result(f"{alias} 不是任何关键词的别名")
+        group = self._group_of(word)
+        if not group:
+            yield event.plain_result(f"{word} 没有绑定其它关键词")
             return
-        aliases = self.alias_groups.get(primary) or []
-        if alias in aliases:
-            aliases.remove(alias)
-        if not aliases:
-            self.alias_groups.pop(primary, None)
+        left = [m for m in self._group_members_full(group) if m != word]
+        snapshot = {k: list(v) for k, v in self.alias_groups.items()}
+        self.alias_groups.pop(group, None)
+        if len(left) >= 2:
+            self.alias_groups[left[0]] = left
         self._refresh_alias_map()
         try:
             self._save_groups()
         except OSError as exc:
-            logger.error("保存别名表失败: %s", exc)
-            yield event.plain_result(f"保存别名失败：{exc}")
+            self.alias_groups = snapshot
+            self._refresh_alias_map()
+            logger.error("保存关键词绑定失败: %s", exc)
+            yield event.plain_result(f"保存绑定失败：{exc}")
             return
-        yield event.plain_result(f"已解绑：{alias}")
+        tail = f"（仍绑定：{'、'.join(left)}）" if len(left) >= 2 else "（该图池已解散）"
+        yield event.plain_result(f"已解绑：{word}{tail}")
 
     async def _handle_alias_list(self, event: AstrMessageEvent, message_str: str):
-        # 别名总览会暴露全部关键词关系，按管理员处理（CHANGELOG 也是这么写的）
+        # 绑定总览会暴露全部关键词关系，按管理员处理（CHANGELOG 也是这么写的）
         if not self._is_admin(event):
             yield event.plain_result("此指令仅限管理员")
             return
@@ -2665,9 +2699,9 @@ class StickerPlugin(Star):
             if not self.alias_groups:
                 yield event.plain_result("还没有任何别名绑定")
                 return
-            lines = ["别名总览："]
-            for primary, aliases in sorted(self.alias_groups.items()):
-                lines.append(f"- {primary} ← {('、'.join(aliases))}")
+            lines = ["关键词绑定总览（同组 = 同一个图池）："]
+            for primary, _members in sorted(self.alias_groups.items()):
+                lines.append("- " + "、".join(self._group_members_full(primary)))
             yield event.plain_result("\n".join(lines))
             return
         keyword, how = self._resolve_keyword(keyword)
@@ -3105,58 +3139,129 @@ class StickerPlugin(Star):
 
     # ---------------- 别名组 ----------------
     def _load_groups(self) -> None:
-        """读取 keyword_groups.json；损坏时按"无别名"处理，不阻塞启动。"""
+        """读取 keyword_groups.json（v3：组 → 成员列表；兼容 v1/v2）。
+
+        v3 用"组"存成员，另建 关键词→组 的映射：
+        解绑只要从组里删掉一个成员，其它成员的关系不受影响。
+        """
         self.alias_groups = {}
         try:
             if self.alias_path.exists():
                 raw = json.loads(self.alias_path.read_text(encoding="utf-8"))
                 groups = (raw or {}).get("groups") if isinstance(raw, dict) else None
                 if isinstance(groups, dict):
-                    for primary, payload in groups.items():
-                        aliases = []
-                        if isinstance(payload, dict):
-                            aliases = [
-                                str(a).strip()
-                                for a in (payload.get("aliases") or [])
-                                if str(a).strip() and str(a).strip() != primary
-                            ]
-                        if aliases:
-                            self.alias_groups[str(primary)] = aliases
+                    for key, payload in groups.items():
+                        members: list = []
+                        if isinstance(payload, list):          # v3
+                            candidates = payload
+                            primary = str(key).strip()
+                        elif isinstance(payload, dict):        # v1/v2
+                            primary = str(payload.get("primary") or key).strip()
+                            candidates = payload.get("members") or payload.get("aliases") or []
+                        else:
+                            continue
+                        for item in candidates:
+                            text = str(item).strip()
+                            if text and text not in members:
+                                members.append(text)
+                        if primary and primary not in members:
+                            members.insert(0, primary)
+                        if len(members) >= 2:
+                            self.alias_groups[primary] = members
         except (json.JSONDecodeError, OSError) as exc:
-            logger.error("读取别名表失败（按无别名处理）: %s", exc)
+            logger.error("读取关键词绑定表失败（按未绑定处理）: %s", exc)
         self._refresh_alias_map()
 
     def _refresh_alias_map(self) -> None:
+        """重建 关键词→组 的映射（组名取首个成员，保证稳定）。"""
         mapping = {}
-        for primary, aliases in self.alias_groups.items():
-            for alias in aliases:
-                mapping[alias] = primary
+        for primary, members in self.alias_groups.items():
+            # 组名自身也要进映射（手写/旧格式里成员列表可能不含主词）
+            for member in (primary, *members):
+                if str(member).strip():
+                    mapping[str(member).strip()] = primary
         self.alias_map = mapping
 
     def _drop_alias_group(self, keyword: str) -> None:
-        """主词被删除时同步摘掉它的别名组，避免悬空别名。"""
+        """关键词被删除时从所属组里摘掉它；组不足 2 人则解散。"""
         groups = self.__dict__.get("alias_groups") or {}
-        if keyword not in groups:
+        primary = self.alias_map.get(keyword)
+        changed = False
+        if primary and primary in groups:
+            groups[primary] = [m for m in groups[primary] if m != keyword]
+            if len(groups[primary]) < 2:
+                groups.pop(primary, None)
+            changed = True
+        for name in list(groups):
+            if keyword in groups[name]:
+                groups[name] = [m for m in groups[name] if m != keyword]
+                if len(groups[name]) < 2:
+                    groups.pop(name, None)
+                changed = True
+        if not changed:
             return
-        groups.pop(keyword, None)
         self._refresh_alias_map()
         try:
             self._save_groups()
         except OSError as exc:
-            logger.warning("清理别名组失败（%s）: %s", keyword, exc)
+            logger.warning("清理关键词绑定失败（%s）: %s", keyword, exc)
 
     def _save_groups(self) -> None:
         payload = {
-            "version": 1,
+            "version": 3,
             "groups": {
-                primary: {"primary": primary, "aliases": list(aliases)}
-                for primary, aliases in self.alias_groups.items()
+                primary: list(members)
+                for primary, members in self.alias_groups.items()
             },
         }
         _atomic_write_json(self.alias_path, payload)
 
+    def _group_members(self, keyword: str) -> list:
+        """该关键词所在图池的成员（含自身），只保留索引里真实存在的。
+
+        图池是并集语义：绑定后 来只A 与 来只B 都从成员合集里抽图，磁盘与索引都不动。
+        """
+        index = getattr(self, "index", None) or {}
+        groups = getattr(self, "alias_groups", None) or {}
+        primary = (getattr(self, "alias_map", None) or {}).get(keyword)
+        if primary:
+            members = list(groups.get(primary) or [])
+            if primary not in members:
+                members.insert(0, primary)
+        else:
+            members = [keyword]
+        seen, resolved = set(), []
+        for member in members:
+            if member in seen:
+                continue
+            seen.add(member)
+            if member in index:
+                resolved.append(member)
+        return resolved or [keyword]
+
+    def _pool_pairs(self, keyword: str) -> list:
+        """图池里的 (关键词, 文件名)，顺序稳定，列表与按序号删图共用。"""
+        pairs = []
+        for member in self._group_members(keyword):
+            for name in self.index.get(member) or []:
+                pairs.append((member, name))
+        return pairs
+
+    def _is_blocked(self, keyword: str) -> bool:
+        """池内任一成员被屏蔽，整个池都不可用。"""
+        blocked = getattr(self, "blocked_keywords", None) or set()
+        return any(member in blocked for member in self._group_members(keyword))
+
+    def _write_target(self, keyword: str) -> str:
+        """新增图片落到组内第一个存在的主词，避免同一池分散到多个目录。"""
+        members = self._group_members(keyword)
+        return members[0] if members else keyword
+
     def _resolve_keyword(self, raw: str):
-        """唯一解析口：真关键词优先，其次别名。返回 (关键词或 None, 方式)。"""
+        """解析口：真关键词优先，其次别名。返回 (关键词或 None, 方式)。
+
+        注意：这只解决"这个名字对应哪个词"，图池的并集读取用 _group_members。
+        """
         text = (raw or "").strip()
         if not text:
             return None, "empty"

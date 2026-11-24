@@ -43,7 +43,7 @@ def test_backup_contains_aliases_and_restore_merges(tmp_path):
         names = zf.namelist()
         aliases = json.loads(zf.read("aliases.json"))
     assert "aliases.json" in names
-    assert aliases["groups"]["蓝色大肥鱼"]["aliases"] == ["大肥鱼"]
+    assert "大肥鱼" in aliases["groups"]["蓝色大肥鱼"], "备份里必须带上组成员"
 
     # 恢复到空环境：别名应一起回来
     fresh = _bot(tmp_path / "fresh")
@@ -51,7 +51,7 @@ def test_backup_contains_aliases_and_restore_merges(tmp_path):
     stats = fresh[1]._restore_from_zip(archive)
 
     assert stats["added"] == 1
-    assert fresh[1].alias_map == {"大肥鱼": "蓝色大肥鱼"}
+    assert fresh[1]._group_of("大肥鱼") == "蓝色大肥鱼"
     assert fresh[1]._resolve_keyword("大肥鱼") == ("蓝色大肥鱼", "alias")
 
 

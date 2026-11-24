@@ -57,10 +57,13 @@ def test_bind_then_resolve_hits_same_pool(tmp_path):
 
     msgs = asyncio.run(_collect(bot._handle_bind(_Event(), "绑定大肥鱼到蓝色大肥鱼")))
     assert any("已绑定" in m for m in msgs), msgs
-    assert bot.alias_map == {"大肥鱼": "蓝色大肥鱼"}
+    assert bot._group_of("大肥鱼") == "蓝色大肥鱼"
+    assert bot._group_of("蓝色大肥鱼") == "蓝色大肥鱼"
     assert bot._resolve_keyword("大肥鱼") == ("蓝色大肥鱼", "alias")
     assert bot._resolve_keyword("蓝色大肥鱼")[1] == "exact"
-    assert json.loads(bot.alias_path.read_text(encoding="utf-8"))["groups"]["蓝色大肥鱼"]["aliases"] == ["大肥鱼"]
+    stored = json.loads(bot.alias_path.read_text(encoding="utf-8"))
+    assert stored["version"] == 3
+    assert stored["groups"]["蓝色大肥鱼"] == ["蓝色大肥鱼", "大肥鱼"]
 
 
 def test_bind_rejects_unknown_primary(tmp_path):
@@ -70,36 +73,54 @@ def test_bind_rejects_unknown_primary(tmp_path):
     assert bot.alias_map == {}
 
 
-def test_bind_rejects_alias_same_as_real_keyword(tmp_path):
+def test_bind_two_real_keywords_merges_pools(tmp_path):
+    """需求变更：两个真实关键词可以绑在一个图池里（并集）。"""
     main, bot = _bot(tmp_path)
-    msgs = asyncio.run(_collect(bot._handle_bind(_Event(), "绑定蓝色大肥鱼到蓝色大肥鱼")))
-    assert any("相同" in m for m in msgs), msgs
-
-
-def test_bind_is_single_level_no_chain(tmp_path):
-    main, bot = _bot(tmp_path)
-    folder = bot.data_dir / "清楚"
+    folder = bot.data_dir / "大肥鱼"
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "b.jpg").write_bytes(b"y" * 8)
-    bot.index["清楚"] = ["b.jpg"]
+    bot.index["大肥鱼"] = ["b.jpg"]
+
+    msgs = asyncio.run(_collect(bot._handle_bind(_Event(), "绑定大肥鱼到蓝色大肥鱼")))
+
+    assert any("已绑定" in m for m in msgs), msgs
+    assert sorted(bot._group_members("大肥鱼")) == ["大肥鱼", "蓝色大肥鱼"]
+    assert sorted(bot._group_members("蓝色大肥鱼")) == ["大肥鱼", "蓝色大肥鱼"]
+    pairs = bot._pool_pairs("大肥鱼")
+    assert ("大肥鱼", "b.jpg") in pairs and ("蓝色大肥鱼", "a.jpg") in pairs
+
+
+def test_bind_same_keyword_is_noop(tmp_path):
+    main, bot = _bot(tmp_path)
+    msgs = asyncio.run(_collect(bot._handle_bind(_Event(), "绑定蓝色大肥鱼到蓝色大肥鱼")))
+    assert any("无需绑定" in m for m in msgs), msgs
+
+
+def test_bind_merges_two_existing_groups(tmp_path):
+    main, bot = _bot(tmp_path)
+    for kw in ("清楚", "清晰", "大肥鱼"):
+        folder = bot.data_dir / kw
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "x.jpg").write_bytes(b"y" * 8)
+        bot.index[kw] = ["x.jpg"]
     asyncio.run(_collect(bot._handle_bind(_Event(), "绑定大肥鱼到蓝色大肥鱼")))
-    # 目标本身是别名 → 拒绝（否则会出现链式/循环）
-    msgs = asyncio.run(_collect(bot._handle_bind(_Event(), "绑定清晰到大肥鱼")))
-    assert any("别名不能再作为主词" in m for m in msgs), msgs
-    # 别名不能劫持已存在的真关键词
-    hijack = asyncio.run(_collect(bot._handle_bind(_Event(), "绑定清楚到蓝色大肥鱼")))
-    assert any("已经是真实关键词" in m for m in hijack), hijack
-    assert bot.alias_map == {"大肥鱼": "蓝色大肥鱼"}
+    asyncio.run(_collect(bot._handle_bind(_Event(), "绑定清晰到清楚")))
+
+    msgs = asyncio.run(_collect(bot._handle_bind(_Event(), "绑定清楚到蓝色大肥鱼")))
+
+    assert any("已绑定" in m for m in msgs), msgs
+    members = sorted(bot._group_members("蓝色大肥鱼"))
+    assert members == sorted(["大肥鱼", "清楚", "清晰", "蓝色大肥鱼"]), members
 
 
 def test_bind_and_unbind_are_idempotent(tmp_path):
     main, bot = _bot(tmp_path)
     asyncio.run(_collect(bot._handle_bind(_Event(), "绑定大肥鱼到蓝色大肥鱼")))
     again = asyncio.run(_collect(bot._handle_bind(_Event(), "绑定大肥鱼到蓝色大肥鱼")))
-    assert any("已经绑定" in m for m in again), again
+    assert any("已经在" in m for m in again), again
     asyncio.run(_collect(bot._handle_unbind(_Event(), "解绑大肥鱼")))
     none_left = asyncio.run(_collect(bot._handle_unbind(_Event(), "解绑大肥鱼")))
-    assert any("不是任何关键词的别名" in m for m in none_left), none_left
+    assert any("没有绑定" in m for m in none_left), none_left
     assert bot.alias_map == {}
 
 
