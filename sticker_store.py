@@ -104,8 +104,11 @@ class Store:
             )
         self.conn.execute("DROP INDEX IF EXISTS ux_image_md5")
         self.conn.execute("CREATE INDEX IF NOT EXISTS ix_image_md5 ON image(md5)")
+        # 版本号必须跟着写入：只补列不改版本会让下次误判"还是老库"
         self.conn.execute(
-            "INSERT OR IGNORE INTO meta(k, v) VALUES(?, ?)", ("schema_version", str(SCHEMA_VERSION))
+            "INSERT INTO meta(k, v) VALUES(?, ?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            ("schema_version", str(SCHEMA_VERSION)),
         )
         self.conn.commit()
 

@@ -123,3 +123,37 @@ def test_set_weight_needs_existing_row(tmp_path):
     main, bot = _bot(tmp_path)
     assert bot._store.set_weight("清楚", "不存在.jpg", 3) is False
     bot._store.close()
+
+def test_schema_version_is_upgraded_on_open(tmp_path):
+    """老库（meta 里写着 1）打开后版本必须升到 2，否则每次启动都以为没迁移。"""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from sticker_store import SCHEMA_VERSION, Store
+
+    db = Store(tmp_path / "index.db")
+    with db.conn:
+        db.conn.execute("UPDATE meta SET v=? WHERE k=?", ("1", "schema_version"))
+    assert db.schema_version() == 1
+    db.close()
+
+    again = Store(tmp_path / "index.db")
+    assert again.schema_version() == SCHEMA_VERSION == 2
+    assert "weight" in [r[1] for r in again.conn.execute("PRAGMA table_info(image)")]
+    again.close()
+
+
+def test_weight_survives_reopen(tmp_path):
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from sticker_store import Store
+
+    db = Store(tmp_path / "index.db")
+    db.sync_index({"清楚": ["a.jpg"]})
+    db.set_weight("清楚", "a.jpg", 0)
+    db.close()
+
+    again = Store(tmp_path / "index.db")
+    assert again.weight_of("清楚", "a.jpg") == 0, "0 权重必须能落盘并读回"
+    again.close()
