@@ -246,6 +246,12 @@ class StickerPlugin(Star):
                 "备份进度（供页面轮询）",
             )
             self.context.register_web_api(
+                f"/{PLUGIN_NAME}/backup/export",
+                self._web_export,
+                ["GET"],
+                "按关键词导出备份（小卷，便于下载）",
+            )
+            self.context.register_web_api(
                 f"/{PLUGIN_NAME}/backups",
                 self._web_backups,
                 ["GET"],
@@ -1363,6 +1369,36 @@ class StickerPlugin(Star):
         state = self.__dict__.get("_backup_state") or {"state": "idle", "percent": 0}
         return json_response({"status": "success", "data": state})
 
+    async def _web_export(self):
+        """按关键词导出：产物是标准备份包，单卷小、下载不易中断。
+
+        为什么加这个：完整备份线上已 600MB 级，而前端下载走的是"整包读进浏览器内存"
+        的通道（框架行为，插件改不了），所以把"可下载单元"做小是当前唯一稳妥的解。
+        """
+        keyword = (request.query.get("keyword") or "").strip()
+        if not keyword:
+            return error_response("缺少关键词")
+        if keyword not in self.index:
+            return error_response(f"关键词 {keyword} 不存在")
+        state = self.__dict__.get("_backup_state") or {}
+        if state.get("state") == "running":
+            return error_response("备份进行中，请稍后再导出")
+        try:
+            info = self._backup_to_zip(prefix="export", only_keyword=keyword)
+        except Exception as exc:
+            logger.error("导出关键词失败: %s", exc, exc_info=True)
+            return error_response(f"导出失败：{exc}")
+        return json_response(
+            {
+                "status": "success",
+                "message": (
+                    f"已导出 {keyword}：{info['images']} 张 / "
+                    f"{info['size'] / 1048576:.1f}MB（{info['filename']}）"
+                ),
+                "data": info,
+            }
+        )
+
     async def _web_download(self):
         name = request.query.get("name", "")
         if not name:
@@ -1477,7 +1513,12 @@ class StickerPlugin(Star):
             }
         )
 
-    def _backup_to_zip(self, prefix: str = "sticker_backup", progress: Optional[dict] = None) -> dict:
+    def _backup_to_zip(
+        self,
+        prefix: str = "sticker_backup",
+        progress: Optional[dict] = None,
+        only_keyword: Optional[str] = None,
+    ) -> dict:
         """把当前全部表情包数据打包为 zip（含 manifest 校验清单）。
 
         prefix 用于区分自动备份（sticker_backup_*）与恢复前快照（pre-restore_*）。
@@ -1489,10 +1530,16 @@ class StickerPlugin(Star):
         )
         target = self.backup_root / filename
         files_meta = []
+        # 只导某个关键词时，索引也只带这一条：产物仍是标准备份包，可直接恢复
+        payload_index = (
+            {only_keyword: self.index[only_keyword]}
+            if only_keyword and only_keyword in self.index
+            else self.index
+        )
         with zipfile.ZipFile(target, "w", zipfile.ZIP_STORED) as zf:
             zf.writestr(
                 "index.json",
-                json.dumps(self.index, ensure_ascii=False, indent=2),
+                json.dumps(payload_index, ensure_ascii=False, indent=2),
             )
             zf.writestr(
                 "blocked_keywords.json",
@@ -1500,7 +1547,7 @@ class StickerPlugin(Star):
             )
             done_since_flush = 0
             last_flush = time.time()
-            for keyword, names in self.index.items():
+            for keyword, names in payload_index.items():
                 folder = self.data_dir / keyword
                 for fname in names:
                     fpath = folder / fname
@@ -1530,7 +1577,8 @@ class StickerPlugin(Star):
                     {
                         "version": 1,
                         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "keywords": len(self.index),
+                        "keywords": len(payload_index),
+                        "only_keyword": only_keyword,
                         "images": len(files_meta),
                         "files": files_meta,
                     },
@@ -1543,7 +1591,7 @@ class StickerPlugin(Star):
         return {
             "filename": filename,
             "size": target.stat().st_size,
-            "keywords": len(self.index),
+            "keywords": len(payload_index),
             "images": len(files_meta),
             "pruned": removed,
         }
@@ -1554,7 +1602,12 @@ class StickerPlugin(Star):
         保护名单：keep_name（本次刚生成）与 pre-restore_*（恢复前快照，只能人工删）。
         """
         try:
-            backups = [p for p in self.backup_root.glob("*.zip") if p.is_file()]
+            # 只淘汰自动备份与恢复快照：export_* 是用户主动导出的产物，不动
+            backups = [
+                p
+                for p in self.backup_root.glob("*.zip")
+                if p.is_file() and (p.name.startswith("sticker_backup") or p.name.startswith("pre-restore"))
+            ]
         except OSError:
             return []
         protected = {name for name in (keep_name,) if name}

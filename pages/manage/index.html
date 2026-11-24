@@ -76,6 +76,11 @@
     <input type="file" id="fileInput" accept=".zip">
     <button id="btnRestore">上传并恢复</button>
   </div>
+  <div class="row" style="margin-bottom:12px">
+    <input id="exportKeyword" placeholder="关键词（导出单个关键词，体积小、好下载）" style="min-width:260px">
+    <button id="btnExport" class="secondary">导出该关键词</button>
+    <span class="muted">完整备份有 600MB 级，网络不稳时建议按关键词导出</span>
+  </div>
   <div class="muted" style="margin-bottom:10px">恢复为合并式：重叠图片按 MD5 自动跳过；结果显示新增 / 覆盖 / 跳过 / 失败数量。</div>
   <table>
     <thead><tr><th>备份文件</th><th>大小</th><th>创建时间</th><th>操作</th></tr></thead>
@@ -198,7 +203,12 @@
         const btn = document.createElement('button');
         btn.className = 'secondary';
         btn.textContent = '下载';
-        btn.onclick = () => A.download('backup/download', { name: item.filename }, item.filename);
+        btn.onclick = () => {
+          if (item.size > 200 * 1024 * 1024) {
+            show('该备份 ' + fmtSize(item.size) + '，下载需保持网络稳定；中断需重新下载（可改用按关键词导出）', true);
+          }
+          A.download('backup/download', { name: item.filename }, item.filename);
+        };
         td4.appendChild(btn);
         const delBtn = document.createElement('button');
         delBtn.className = 'danger';
@@ -262,14 +272,47 @@
     }
   };
 
+  async function pollBackupProgress() {
+    for (let i = 0; i < 600; i += 1) {
+      const p = await A.apiGet('backup/progress');
+      const st = (p && p.data) || {};
+      if (st.state === 'running') {
+        show('备份中 ' + (st.percent || 0) + '%（' + (st.done_files || 0) + '/' + (st.total_files || 0) + ' 个文件）');
+        await new Promise((r) => setTimeout(r, 500));
+        continue;
+      }
+      if (st.state === 'failed') { show('备份失败：' + (st.error || '未知错误'), true); return; }
+      if (st.state === 'done') {
+        show('备份完成：' + (st.filename || '') + '（' + fmtSize(st.size || 0) + '）');
+        refreshBackups();
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    show('备份仍在进行，稍后到列表查看');
+  }
+
   document.getElementById('btnBackup').onclick = async () => {
     try {
-      show('正在备份...');
+      show('正在受理备份...');
       const r = await A.apiGet('backup');
-      show((r && r.message) || JSON.stringify(r));
-      refreshBackups();
+      show((r && r.message) || '备份已开始');
+      await pollBackupProgress();
     } catch (e) {
       show('备份失败：' + (e && e.message ? e.message : e), true);
+    }
+  };
+
+  document.getElementById('btnExport').onclick = async () => {
+    const keyword = (document.getElementById('exportKeyword').value || '').trim();
+    if (!keyword) { show('请先填关键词', true); return; }
+    try {
+      show('正在导出 ' + keyword + '...');
+      const r = await A.apiGet('backup/export', { keyword: keyword });
+      show((r && r.message) || '导出完成');
+      refreshBackups();
+    } catch (e) {
+      show('导出失败：' + (e && e.message ? e.message : e), true);
     }
   };
 
