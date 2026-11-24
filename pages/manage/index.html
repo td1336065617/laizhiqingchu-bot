@@ -246,7 +246,7 @@
           delBtn.textContent = '删除';
           try {
             const r = await A.apiPost('backup/delete', { name: item.filename });
-            show((r && r.message) || '已删除备份文件');
+            show((r && (r.message || r.deleted)) ? ('已删除 ' + item.filename) : '已删除备份文件');
             refreshBackups();
           } catch (e) {
             show('删除备份失败：' + (e && e.message ? e.message : e), true);
@@ -296,7 +296,8 @@
   async function pollBackupProgress() {
     for (let i = 0; i < 600; i += 1) {
       const p = await A.apiGet('backup/progress');
-      const st = (p && p.data) || {};
+      // 桥接层会把 {status, data} 解包成 data，这里不能再读一层 .data
+      const st = p || {};
       if (st.state === 'running') {
         show('备份中 ' + (st.percent || 0) + '%（' + (st.done_files || 0) + '/' + (st.total_files || 0) + ' 个文件）');
         await new Promise((r) => setTimeout(r, 500));
@@ -317,7 +318,9 @@
     try {
       show('正在受理备份...');
       const r = await A.apiGet('backup');
-      show((r && r.message) || '备份已开始');
+      show(r && r.state === 'running'
+        ? ('备份中 ' + (r.percent || 0) + '%')
+        : ('备份已开始（' + ((r && r.total_files) || 0) + ' 个文件）'));
       await pollBackupProgress();
     } catch (e) {
       show('备份失败：' + (e && e.message ? e.message : e), true);
@@ -330,7 +333,9 @@
     try {
       show('正在导出 ' + keyword + '...');
       const r = await A.apiGet('backup/export', { keyword: keyword });
-      show((r && r.message) || '导出完成');
+      show(r && r.filename
+        ? ('已导出 ' + (r.images || 0) + ' 张 / ' + fmtSize(r.size || 0) + '：' + r.filename)
+        : '导出完成');
       refreshBackups();
     } catch (e) {
       show('导出失败：' + (e && e.message ? e.message : e), true);
@@ -341,12 +346,13 @@
     try {
       show('正在扫描...');
       const r = await A.apiGet('maintenance/scan');
-      const d = (r && r.data) || {};
+      const d = r || {};
       show(
         '磁盘有索引无：' + ((d.disk_only_keywords || []).join('、') || '无') +
         '\n索引有磁盘无：' + ((d.index_only_keywords || []).join('、') || '无') +
         '\n缺失文件：' + (d.missing_files_total || 0) + ' 个' +
-        '\n空目录：' + ((d.empty_dirs || []).join('、') || '无')
+        '\n空目录：' + ((d.empty_dirs || []).join('、') || '无') +
+        '\n多余文件：' + (d.disk_orphan_files_total || 0) + ' 个'
       );
     } catch (e) {
       show('扫描失败：' + (e && e.message ? e.message : e), true);
@@ -358,7 +364,7 @@
     try {
       if (btn.dataset.armed !== '1') {
         const r = await A.apiPost('maintenance/dedupe', {});
-        const d = (r && r.data) || {};
+        const d = r || {};
         show('干跑结果：可归并 ' + (d.groups || 0) + ' 组 / ' + (d.files || 0) + ' 个文件，预计回收 ' + (d.reclaimed_mb || 0) + 'MB。\n确认执行请再次点击「去重」（10 秒内）。');
         btn.dataset.armed = '1';
         btn.textContent = '再次点击确认去重';
@@ -367,8 +373,8 @@
       }
       btn.dataset.armed = '';
       btn.textContent = '去重（先干跑）';
-      const r = await A.apiPost('maintenance/dedupe', { apply: true });
-      const d = (r && r.data) || {};
+      const r = await A.apiPost('maintenance/dedupe', { apply: true, confirm: 'dedupe' });
+      const d = r || {};
       show('去重完成：' + (d.done || 0) + ' 个文件归并，失败 ' + (d.failed || 0) + ' 个，回收约 ' + (d.reclaimed_mb || 0) + 'MB');
     } catch (e) {
       show('去重失败：' + (e && e.message ? e.message : e), true);

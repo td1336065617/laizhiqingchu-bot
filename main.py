@@ -564,7 +564,7 @@ class StickerPlugin(Star):
             return 0, 0, 0, reason
 
         folder = self.data_dir / keyword
-        folder.mkdir(parents=True, exist_ok=True)
+        # 目录延后创建：整批都被拒时不该在磁盘上留下空目录（P3 审计 5）
         # 目录级 MD5 缓存：原来每次添加都要把整个关键词目录重算一遍（线上 637MB 约 2.5s）
         cached_md5 = self._folder_md5s(keyword)
         existing_md5 = set(cached_md5.values())
@@ -615,6 +615,7 @@ class StickerPlugin(Star):
             ext = tmp_path.suffix.lower()
             if ext not in ALLOWED_EXTS:
                 ext = ".jpg"
+            folder.mkdir(parents=True, exist_ok=True)
             filename = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}{ext}"
             target = folder / filename
             try:
@@ -630,7 +631,10 @@ class StickerPlugin(Star):
 
         if refused:
             self.__dict__["_last_refused_count"] = refused
-        self._save_index()
+        if added or skipped or failed:
+            self._save_index()
+        else:
+            logger.info("本批全部被拒，未改动索引（关键词=%s）", keyword)
         reason = None
         if refused and not added and not skipped:
             reason = f"全部 {refused} 张都超过单图上限（{self._max_image_mb()}MB），已跳过"
@@ -1217,6 +1221,7 @@ class StickerPlugin(Star):
                         str(a) for a in (self.config.get("admin_users", []) or [])
                     ],
                     "max_storage_mb": self._max_storage_mb(),
+                    "max_image_mb": self._max_image_mb(),
                     "backup_keep": self._backup_keep(),
                     "backup_total_mb": self._backup_total_mb(),
                     "storage": self._storage_usage(),
@@ -1360,6 +1365,15 @@ class StickerPlugin(Star):
                 raise ValueError("max_storage_mb 必须大于 0")
             self.config["max_storage_mb"] = limit
             updated["max_storage_mb"] = limit
+        if "max_image_mb" in payload:
+            try:
+                max_image = int(payload["max_image_mb"])
+            except (TypeError, ValueError):
+                raise ValueError("max_image_mb 必须是整数")
+            if not 0 <= max_image <= 50:
+                raise ValueError("max_image_mb 必须在 0~50 之间（0 表示不限制）")
+            self.config["max_image_mb"] = max_image
+            updated["max_image_mb"] = max_image
         if "backup_keep" in payload:
             try:
                 keep = int(payload["backup_keep"])
@@ -1517,7 +1531,11 @@ class StickerPlugin(Star):
 
     async def _web_maintenance_dedupe(self):
         payload = await request.json(default=None)
-        dry_run = True if not isinstance(payload, dict) else bool(payload.get("apply") is not True)
+        want_apply = isinstance(payload, dict) and payload.get("apply") is True
+        if want_apply and str((payload or {}).get("confirm") or "") != "dedupe":
+            # 改盘操作必须显式二次确认：防止一次误调用就动 inode
+            return error_response("去重需要二次确认（confirm=dedupe）")
+        dry_run = not want_apply
         try:
             report = await asyncio.to_thread(self._dedupe_by_hardlink, dry_run)
         except Exception as exc:
@@ -2354,12 +2372,22 @@ class StickerPlugin(Star):
             for name in names:
                 if name not in present:
                     missing_files.append(f"{keyword}/{name}")
+        # 已索引关键词里、磁盘上多出来的文件（既不在索引、也永远不会被发送）
+        disk_orphan_files = []
+        for keyword, files in disk.items():
+            if keyword not in indexed:
+                continue
+            extra = set(files) - set(indexed[keyword])
+            for name in sorted(extra):
+                disk_orphan_files.append(f"{keyword}/{name}")
         empty_dirs = sorted(k for k, files in disk.items() if not files)
         return {
             "disk_only_keywords": disk_only_keywords,
             "index_only_keywords": index_only_keywords,
             "missing_files": missing_files[:200],
             "missing_files_total": len(missing_files),
+            "disk_orphan_files": disk_orphan_files[:200],
+            "disk_orphan_files_total": len(disk_orphan_files),
             "empty_dirs": empty_dirs,
         }
 
