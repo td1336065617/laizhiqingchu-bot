@@ -18,7 +18,7 @@ import threading
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS image (
     ext TEXT,
     bytes INTEGER,
     created_at REAL,
+    weight INTEGER NOT NULL DEFAULT 1,
     UNIQUE(kw, filename)
 );
 CREATE INDEX IF NOT EXISTS ix_image_kw ON image(kw, id);
@@ -93,6 +94,14 @@ class Store:
         self.conn.commit()
         # 早期版本在 (kw, md5) 上建了 UNIQUE：同一关键词里本来就可能有多张相同图片
         # （去重场景），撞唯一约束会让整批回填写入回滚。这里一次性纠正。
+        # v2：image.weight（图片出现权重，默认 1，0 = 永不发送）
+        columns = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(image)")
+        }
+        if "weight" not in columns:
+            self.conn.execute(
+                "ALTER TABLE image ADD COLUMN weight INTEGER NOT NULL DEFAULT 1"
+            )
         self.conn.execute("DROP INDEX IF EXISTS ux_image_md5")
         self.conn.execute("CREATE INDEX IF NOT EXISTS ix_image_md5 ON image(md5)")
         self.conn.execute(
@@ -169,11 +178,19 @@ class Store:
                             md5, size, ext = md5_of(kw, filename)
                         except Exception:
                             md5 = ext = size = None
+                    # 不能用 INSERT OR REPLACE：那是先删后插，会把 weight 重置成 1
                     self.conn.execute(
-                        "INSERT OR REPLACE INTO image(kw, filename, md5, ext, bytes, created_at) "
-                        "VALUES(?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO image(kw, filename, md5, ext, bytes, created_at) "
+                        "VALUES(?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(kw, filename) DO NOTHING",
                         (kw, filename, md5, ext, size, 0),
                     )
+                    if md5 is not None:
+                        self.conn.execute(
+                            "UPDATE image SET md5=COALESCE(md5, ?), bytes=COALESCE(bytes, ?), "
+                            "ext=COALESCE(ext, ?) WHERE kw=? AND filename=?",
+                            (md5, size, ext, kw, filename),
+                        )
                 placeholders = ",".join("?" for _ in names) or "''"
                 if names:
                     self.conn.execute(
@@ -206,6 +223,76 @@ class Store:
                     "UPDATE image SET md5=? WHERE kw=? AND filename=?",
                     (digest, keyword, filename),
                 )
+
+    def weights_of(self, keyword: str) -> Dict[str, int]:
+        """该关键词下 {文件名: 权重}；未设置的按 1 返回（列默认值即 1）。"""
+        rows = self.conn.execute(
+            "SELECT filename, weight FROM image WHERE kw=?", (keyword,)
+        ).fetchall()
+        # 不能用 weight or 1：0 是合法值（永不发送），会被 or 吞成 1
+        return {
+            row["filename"]: (1 if row["weight"] is None else int(row["weight"]))
+            for row in rows
+        }
+
+    def weight_of(self, keyword: str, filename: str) -> int:
+        row = self.conn.execute(
+            "SELECT weight FROM image WHERE kw=? AND filename=?", (keyword, filename)
+        ).fetchone()
+        if not row:
+            return 1
+        return 1 if row["weight"] is None else int(row["weight"])
+
+    def set_weight(self, keyword: str, filename: str, weight: int) -> bool:
+        with self._lock, self.conn:
+            cursor = self.conn.execute(
+                "UPDATE image SET weight=? WHERE kw=? AND filename=?",
+                (int(weight), keyword, filename),
+            )
+        return cursor.rowcount > 0
+
+    def set_weights(self, keyword: str, mapping: Dict[str, int]) -> int:
+        changed = 0
+        with self._lock, self.conn:
+            for filename, weight in mapping.items():
+                cursor = self.conn.execute(
+                    "UPDATE image SET weight=? WHERE kw=? AND filename=?",
+                    (int(weight), keyword, filename),
+                )
+                changed += 1 if cursor.rowcount > 0 else 0
+        return changed
+
+    def reset_weights(self, keyword: Optional[str] = None) -> int:
+        with self._lock, self.conn:
+            if keyword:
+                cursor = self.conn.execute(
+                    "UPDATE image SET weight=1 WHERE kw=? AND weight<>1", (keyword,)
+                )
+            else:
+                cursor = self.conn.execute("UPDATE image SET weight=1 WHERE weight<>1")
+        return cursor.rowcount
+
+    def export_weights(self) -> Dict[str, int]:
+        """导出非默认权重：{"关键词/文件名": 权重}，用于备份。"""
+        rows = self.conn.execute(
+            "SELECT kw, filename, weight FROM image WHERE weight<>1"
+        ).fetchall()
+        return {f"{row['kw']}/{row['filename']}": int(row["weight"]) for row in rows}
+
+    def import_weights(self, mapping: Dict[str, int]) -> int:
+        applied = 0
+        with self._lock, self.conn:
+            for key, weight in (mapping or {}).items():
+                key = str(key)
+                if "/" not in key:
+                    continue
+                keyword, filename = key.split("/", 1)
+                cursor = self.conn.execute(
+                    "UPDATE image SET weight=? WHERE kw=? AND filename=?",
+                    (int(weight), keyword, filename),
+                )
+                applied += 1 if cursor.rowcount > 0 else 0
+        return applied
 
     def delete_by_md5(self, md5s: Iterable[str], keyword: Optional[str] = None) -> List[Tuple[str, str]]:
         wanted = [m for m in md5s if m]

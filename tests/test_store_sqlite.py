@@ -39,7 +39,7 @@ def test_store_schema_and_roundtrip(tmp_path):
     from sticker_store import Store
 
     store = Store(tmp_path / "index.db")
-    assert store.schema_version() == 1
+    assert store.schema_version() == 2
     assert store.integrity() == "ok"
     store.sync_index({"清楚": ["a.jpg", "b.jpg"]})
     assert store.counts() == {"keywords": 1, "images": 2}
@@ -86,7 +86,7 @@ def test_clear_content_keeps_meta(tmp_path):
     store.sync_index({"清楚": ["a.jpg"]})
     store.clear_content()
     assert store.counts() == {"keywords": 0, "images": 0}
-    assert store.schema_version() == 1, "清空内容不得清掉 schema 版本"
+    assert store.schema_version() == 2, "清空内容不得清掉 schema 版本"
     store.close()
 
 

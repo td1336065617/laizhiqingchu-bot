@@ -79,6 +79,9 @@ RESERVED_KEYWORDS = {
     "授予管理员",
     "撤销管理员",
     "管理员列表",
+    "权重",
+    "权重列表",
+    "权重重置",
 }
 # 二次删除确认的有效期（秒）
 # 平台占位 ID：官方适配器在取不到真实 id 时会塞这些值（不可当管理员）
@@ -154,6 +157,9 @@ MENU_TEXT = "\n".join(
         "• 授予管理员 ─ @某人 后发本条，或 授予管理员{ID}",
         "• 撤销管理员 ─ @某人 后发本条，或 撤销管理员{ID}",
         "• 管理员列表 ─ 查看管理员（ID 已脱敏）",
+        "• 权重{0~99} ─ 回复一张图，设置它出现的权重（0 = 永不发送）",
+        "• 权重列表{关键词} ─ 查看非默认权重的图片",
+        "• 权重重置{关键词} ─ 全部恢复默认权重 1",
         "━━━━━━━━━━━━",
         "⚙️ 备份/恢复/管理员设置：WebUI 表情包管理页",
         "🔗 开源：https://github.com/td1336065617/laizhiqingchu-bot",
@@ -463,6 +469,15 @@ class StickerPlugin(Star):
             elif message_str.startswith("撤销管理员"):
                 async for result in self._handle_revoke_admin(event, message_str):
                     yield result
+            elif message_str.startswith("权重列表"):
+                async for result in self._handle_weight_list(event, message_str):
+                    yield result
+            elif message_str.startswith("权重重置"):
+                async for result in self._handle_weight_reset(event, message_str):
+                    yield result
+            elif message_str.startswith("权重"):
+                async for result in self._handle_weight(event, message_str):
+                    yield result
             elif message_str.startswith("管理员列表"):
                 async for result in self._handle_admin_list(event):
                     yield result
@@ -683,17 +698,12 @@ class StickerPlugin(Star):
             yield event.plain_result(f"关键词 {keyword} 已被屏蔽，无法发送")
             return
 
-        # 图池：绑定过的关键词共用一个池子，从并集里随机抽
-        pairs = self._pool_pairs(keyword)
-        pairs = [
-            (member, name)
-            for member, name in pairs
-            if (self.data_dir / member / name).is_file()
-        ]
-        if not pairs:
+        # 图池：绑定过的关键词共用一个池子；按每张图的权重抽
+        picked = self._pick_from_pool(keyword)
+        if picked is None:
             yield event.plain_result(f"关键词 {keyword} 下还不存在图片")
             return
-        member, filename = random.choice(pairs)
+        member, filename = picked
         yield event.image_result(str((self.data_dir / member / filename).resolve()))
 
     # ------------------------------------------------------------------
@@ -1125,14 +1135,16 @@ class StickerPlugin(Star):
         if recent is not None:
             recent.update({"deduped": True, "note": "%d 秒内已经发过同关键词的表情包，没有重复发送" % window})
             return ai_common.ok(recent)
-        filename = ai_impl.pick_sticker(files)
-        if not filename:
+        # 与人类指令同源：图池并集 + 每张图的权重（0 = 永不发送）
+        pairs, weights = self._pool_weights(keyword)
+        if not pairs:
             return ai_common.fail("not_found", "没有挑到可用的图片")
-        path = (self.data_dir / keyword / filename).resolve()
+        member, filename = random.choices(pairs, weights=weights, k=1)[0]
+        path = (self.data_dir / member / filename).resolve()
         payload = {
             "keyword": keyword,
             "file": filename,
-            "count": len(files),
+            "count": len(pairs),
             "deduped": False,
             "text": "已发送关键词「%s」下的 1 张表情包" % keyword,
         }
@@ -1873,6 +1885,18 @@ class StickerPlugin(Star):
                     if only_keyword in groups
                     else {}
                 )
+            # 权重（存在 SQLite 里，导出成 JSON 才能跟包走）
+            store = self.__dict__.get("_store")
+            weights_export = {}
+            if store is not None:
+                try:
+                    weights_export = store.export_weights()
+                except Exception as exc:
+                    logger.warning("导出权重失败: %s", exc)
+            zf.writestr(
+                "weights.json",
+                json.dumps({"version": 1, "weights": weights_export}, ensure_ascii=False, indent=2),
+            )
             zf.writestr(
                 "aliases.json",
                 json.dumps(
@@ -2043,7 +2067,7 @@ class StickerPlugin(Star):
         merged = 0
         conflicts = 0
         self.alias_groups = self.__dict__.get("alias_groups") or {}
-        known = set(self.index) | set(restored_keywords)
+        set(self.index) | set(restored_keywords)  # 仅用于调试时观察成员范围
         for primary, payload in groups.items():
             primary = str(primary)
             if isinstance(payload, dict):
@@ -2135,6 +2159,7 @@ class StickerPlugin(Star):
                 "blocked_keywords.json",
                 "aliases.json",
                 "admin.json",
+                "weights.json",
             )
             for member in members:
                 if member in meta_members:
@@ -2192,6 +2217,14 @@ class StickerPlugin(Star):
             self._save_index()
 
             # 别名表：v2 包才可能有；缺失视为"无别名"，不影响 v1 恢复
+            weights_applied = 0
+            if "weights.json" in members and self.__dict__.get("_store") is not None:
+                try:
+                    payload = json.loads(zf.read("weights.json").decode("utf-8"))
+                    weights_applied = self._store.import_weights(payload.get("weights") or {})
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    logger.warning("备份里的 weights.json 无法解析，已跳过：%s", exc)
+
             aliases_merged = 0
             if "aliases.json" in members:
                 try:
@@ -2204,6 +2237,7 @@ class StickerPlugin(Star):
         return {
             "archive_keywords": len(archive_index),
             "aliases_merged": aliases_merged,
+            "weights_applied": weights_applied,
             "archive_images": archive_images,
             "added": added,
             "skipped": skipped,
@@ -2220,6 +2254,127 @@ class StickerPlugin(Star):
     # ------------------------------------------------------------------
     # H. 屏蔽关键词（仅管理员）
     # ------------------------------------------------------------------
+    # ---------------- 图片权重 ----------------
+    WEIGHT_MAX = 99
+
+    async def _reply_images(self, event):
+        """取被回复消息里的图片（与删图同一套提取逻辑）。"""
+        return self._extract_reply_images(event) or []
+
+    def _locate_by_md5(self, md5s) -> list:
+        """在索引里定位这些 MD5 对应的 (关键词, 文件名)，走目录缓存避免重算。"""
+        targets = {m for m in md5s if m}
+        if not targets:
+            return []
+        hits = []
+        for keyword in list(self.index):
+            try:
+                mapping = self._folder_md5s(keyword)
+            except Exception:
+                continue
+            for filename, digest in mapping.items():
+                if digest in targets:
+                    hits.append((keyword, filename))
+        return hits
+
+    async def _handle_weight(self, event: AstrMessageEvent, message_str: str):
+        """权重{数字}（回复一张图）：设置该图在所属关键词里的出现权重。0 = 永不发送。"""
+        if not self._is_admin(event):
+            yield event.plain_result("此指令仅限管理员")
+            return
+        raw = message_str[len("权重") :].strip()
+        try:
+            weight = int(raw)
+        except (TypeError, ValueError):
+            yield event.plain_result("用法：回复一张图片并发送「权重5」（0~99，0 表示以后不再发送）")
+            return
+        if not 0 <= weight <= self.WEIGHT_MAX:
+            yield event.plain_result(f"权重必须是 0~{self.WEIGHT_MAX} 的整数（0 = 永不发送）")
+            return
+        images = await self._reply_images(event)
+        if not images:
+            yield event.plain_result("请回复一张表情包图片，再发送「权重%d」" % weight)
+            return
+        if self.__dict__.get("_store") is None:
+            yield event.plain_result("当前是纯 JSON 存储模式（STICKER_STORAGE=json），权重不可用")
+            return
+        md5s = set()
+        failed = 0
+        for img in images:
+            try:
+                path = Path(await img.convert_to_file_path())
+                md5s.add(self._md5(path))
+            except Exception as exc:
+                failed += 1
+                logger.warning("计算图片 MD5 失败: %s", exc)
+        hits = self._locate_by_md5(md5s)
+        if not hits:
+            yield event.plain_result("这张图不在表情包库里（先添加再设权重）")
+            return
+        changed = 0
+        for keyword, filename in hits:
+            try:
+                if self._store.set_weight(keyword, filename, weight):
+                    changed += 1
+            except Exception as exc:
+                logger.error("设置权重失败（%s/%s）: %s", keyword, filename, exc)
+        if not changed:
+            yield event.plain_result("没有可更新的图片条目")
+            return
+        note = "（0 = 以后不再发送）" if weight == 0 else ""
+        yield event.plain_result(f"已把 {changed} 张图的权重设为 {weight}{note}")
+
+    async def _handle_weight_list(self, event: AstrMessageEvent, message_str: str):
+        if not self._is_admin(event):
+            yield event.plain_result("此指令仅限管理员")
+            return
+        keyword = message_str[len("权重列表") :].strip()
+        if self.__dict__.get("_store") is None:
+            yield event.plain_result("当前是纯 JSON 存储模式，权重不可用")
+            return
+        members = self._group_members(keyword) if keyword else list(self.index)
+        if keyword and not members:
+            yield event.plain_result(f"关键词 {keyword} 不存在")
+            return
+        lines = []
+        for member in members:
+            try:
+                mapping = self._store.weights_of(member)
+            except Exception:
+                continue
+            rows = sorted(
+                (name, w) for name, w in mapping.items() if int(w or 1) != 1
+            )
+            if not rows:
+                continue
+            lines.append(f"[{member}]")
+            for name, w in rows[:20]:
+                lines.append(f"  {name} → {w}" + ("（永不发送）" if int(w) == 0 else ""))
+        if not lines:
+            yield event.plain_result("没有非默认权重的图片（默认权重都是 1）")
+            return
+        yield event.plain_result("图片权重（仅列非默认）：\n" + "\n".join(lines))
+
+    async def _handle_weight_reset(self, event: AstrMessageEvent, message_str: str):
+        if not self._is_admin(event):
+            yield event.plain_result("此指令仅限管理员")
+            return
+        keyword = message_str[len("权重重置") :].strip()
+        if self.__dict__.get("_store") is None:
+            yield event.plain_result("当前是纯 JSON 存储模式，权重不可用")
+            return
+        if keyword:
+            members = self._group_members(keyword)
+            if not members:
+                yield event.plain_result(f"关键词 {keyword} 不存在")
+                return
+            total = 0
+            for member in members:
+                total += self._store.reset_weights(member)
+        else:
+            total = self._store.reset_weights(None)
+        yield event.plain_result(f"已重置 {total} 张图片的权重为 1")
+
     # ---------------- 管理员授予 ----------------
     def _admin_entries(self) -> list:
         return [
@@ -3246,6 +3401,42 @@ class StickerPlugin(Star):
             for name in self.index.get(member) or []:
                 pairs.append((member, name))
         return pairs
+
+    def _weight_of(self, keyword: str, filename: str) -> int:
+        """图片权重：1 = 默认；0 = 永不发送。DB 不可用时一律按 1。"""
+        store = self.__dict__.get("_store")
+        if store is None:
+            return 1
+        try:
+            return max(0, int(store.weight_of(keyword, filename)))
+        except Exception as exc:
+            logger.warning("读取权重失败（%s/%s）: %s", keyword, filename, exc)
+            return 1
+
+    def _pool_weights(self, keyword: str):
+        """返回 (可选 pairs, 对应权重)；权重全为 0 时退回均匀，避免整池发不出图。"""
+        pairs = [
+            (member, name)
+            for member, name in self._pool_pairs(keyword)
+            if (self.data_dir / member / name).is_file()
+        ]
+        if not pairs:
+            return [], []
+        weights = [self._weight_of(member, name) for member, name in pairs]
+        if sum(weights) <= 0:
+            logger.info("关键词 %s 的图池权重全为 0，退回均匀抽取", keyword)
+            weights = [1] * len(pairs)
+        return pairs, weights
+
+    def _pick_from_pool(self, keyword: str):
+        """按权重从图池抽一张，返回 (关键词, 文件名) 或 None。"""
+        pairs, weights = self._pool_weights(keyword)
+        if not pairs:
+            return None
+        try:
+            return random.choices(pairs, weights=weights, k=1)[0]
+        except ValueError:      # 理论上不会发生，兜底均匀
+            return random.choice(pairs)
 
     def _is_blocked(self, keyword: str) -> bool:
         """池内任一成员被屏蔽，整个池都不可用。"""
