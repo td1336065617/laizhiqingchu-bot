@@ -6,28 +6,207 @@
 <title>表情包管理</title>
 <script src="/api/plugin/page/bridge-sdk.js"></script>
 <style>
-  :root { color-scheme: light dark; }
-  body { font-family: system-ui, "Microsoft YaHei", sans-serif; margin: 0; padding: 24px; }
-  h1 { font-size: 20px; margin: 0 0 16px; }
-  h2 { font-size: 16px; margin: 0 0 10px; }
-  .card { border: 1px solid rgba(128,128,128,.25); border-radius: 10px; padding: 16px 20px; margin-bottom: 18px; background: rgba(128,128,128,.06); }
-  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  button { padding: 8px 18px; border: 0; border-radius: 8px; background: #3b82f6; color: #fff; cursor: pointer; font-size: 14px; }
-  button:hover { opacity: .9; }
-  button.secondary { background: #6b7280; }
-  button.danger { background: #dc2626; }
-  input[type=text], input[type=number], input[type=file] { font-size: 14px; padding: 7px 10px; border: 1px solid rgba(128,128,128,.35); border-radius: 8px; background: transparent; color: inherit; }
-  input[type=number] { width: 120px; }
-  #result { display: none; margin-bottom: 18px; padding: 10px 12px; border-radius: 8px; background: rgba(34,197,94,.12); color: #16a34a; white-space: pre-wrap; font-size: 14px; }
-  #result.error { background: rgba(239,68,68,.12); color: #dc2626; }
-  table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid rgba(128,128,128,.2); }
-  th { font-weight: 600; }
-  .muted { color: #888; font-size: 13px; }
+  :root {
+    color-scheme: light;
+    --bg: #f6f4fb;
+    --surface: #ffffff;
+    --surface-2: #fbf9fe;
+    --line: rgba(103, 58, 122, .12);
+    --line-strong: rgba(103, 58, 122, .22);
+    --fg-1: #35243d;
+    --fg-2: #6a5573;
+    --fg-3: #9a8ba4;
+    --pink: #d34f93;
+    --pink-2: #f379b3;
+    --ice: #38b6d4;
+    --ok: #1f9d6b;
+    --warn: #d08a1a;
+    --err: #d13a63;
+    --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 22px;
+    --r-sm: 8px; --r-md: 12px; --r-lg: 18px; --r-pill: 999px;
+    --sh-1: 0 2px 6px rgba(53, 36, 61, .05), 0 10px 28px rgba(53, 36, 61, .06);
+    --sh-2: 0 6px 18px rgba(211, 79, 147, .18);
+    --t: 160ms ease;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    font-family: "Noto Sans CJK SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+    color: var(--fg-1);
+    font-size: 14px;
+    line-height: 1.6;
+    padding: 20px 20px 40px;
+    background:
+      radial-gradient(820px 320px at 6% -8%, rgba(243, 121, 179, .16), transparent 62%),
+      radial-gradient(760px 300px at 98% 4%, rgba(56, 182, 212, .14), transparent 60%),
+      var(--bg);
+    background-attachment: fixed;
+  }
+
+  /* 顶栏 */
+  .topbar {
+    display: flex; align-items: center; gap: var(--sp-3);
+    margin: 0 0 var(--sp-4); padding: 14px 18px;
+    background: linear-gradient(135deg, rgba(255,255,255,.96), rgba(255,248,252,.9));
+    border: 1px solid var(--line); border-radius: var(--r-lg);
+    box-shadow: var(--sh-1);
+  }
+  .brand-dot {
+    width: 12px; height: 12px; border-radius: 50%; flex: 0 0 auto;
+    background: linear-gradient(135deg, var(--pink), var(--ice));
+    box-shadow: 0 0 12px rgba(211, 79, 147, .55);
+  }
+  .topbar-title { font-size: 18px; font-weight: 800; letter-spacing: .3px; margin-right: auto; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 12px; border-radius: var(--r-pill);
+    background: rgba(211, 79, 147, .1); color: var(--pink);
+    font-size: 12px; font-weight: 700; white-space: nowrap;
+  }
+
+  /* 卡片 */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    box-shadow: var(--sh-1);
+    padding: var(--sp-5);
+    margin-bottom: var(--sp-4);
+    transition: box-shadow var(--t), transform var(--t);
+  }
+  .card:hover { box-shadow: 0 4px 10px rgba(53,36,61,.06), 0 16px 40px rgba(53,36,61,.08); }
+  .card > h2 {
+    display: flex; align-items: center; gap: var(--sp-2);
+    margin: 0 0 var(--sp-4); padding-left: 12px;
+    font-size: 15px; font-weight: 800; color: var(--fg-1);
+    position: relative;
+  }
+  .card > h2::before {
+    content: ""; position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+    width: 4px; height: 16px; border-radius: var(--r-pill);
+    background: linear-gradient(180deg, var(--pink), var(--ice));
+  }
+
+  /* 行与表单 */
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  label { color: var(--fg-2); font-size: 13px; }
+  input[type="text"], input[type="number"], input[type="file"], select {
+    font: inherit; color: var(--fg-1);
+    padding: 8px 12px; min-width: 120px;
+    background: var(--surface-2);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-md);
+    transition: border-color var(--t), box-shadow var(--t), background var(--t);
+  }
+  input[type="number"] { width: 120px; }
+  input[type="text"] { min-width: 260px; }
+  #exportKeyword { min-width: 320px; }
+  input:hover { border-color: rgba(211, 79, 147, .4); }
+  input:focus, select:focus {
+    outline: none; background: #fff;
+    border-color: var(--pink);
+    box-shadow: 0 0 0 3px rgba(211, 79, 147, .16);
+  }
+  input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--pink); vertical-align: -2px; }
+  input[type="file"] { padding: 6px 10px; background: var(--surface-2); }
+  input[type="file"]::file-selector-button {
+    font: inherit; margin-right: 10px; padding: 6px 12px;
+    color: var(--fg-1); background: #fff; cursor: pointer;
+    border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+    transition: background var(--t), border-color var(--t);
+  }
+  input[type="file"]::file-selector-button:hover { background: #fff5fa; border-color: var(--pink); }
+
+  /* 按钮 */
+  button {
+    font: inherit; font-weight: 600; white-space: nowrap;
+    padding: 8px 16px; cursor: pointer;
+    color: #fff; border: 1px solid transparent;
+    border-radius: var(--r-md);
+    background: linear-gradient(135deg, var(--pink), var(--pink-2));
+    box-shadow: var(--sh-2);
+    transition: transform var(--t), box-shadow var(--t), filter var(--t), background var(--t), color var(--t);
+  }
+  button:hover { filter: brightness(1.04); transform: translateY(-1px); }
+  button:active { transform: translateY(0); filter: brightness(.97); }
+  button:focus-visible { outline: 2px solid var(--pink); outline-offset: 2px; }
+  button.secondary {
+    color: var(--fg-1); background: var(--surface-2);
+    border-color: var(--line-strong); box-shadow: none;
+  }
+  button.secondary:hover { background: #fff5fa; border-color: var(--pink); color: var(--pink); }
+  button.danger {
+    background: linear-gradient(135deg, var(--err), #e8708c);
+    box-shadow: 0 6px 18px rgba(209, 58, 99, .18);
+  }
+  button.danger:hover { filter: brightness(1.05); }
+
+  /* 表格 */
+  .table-wrap { overflow-x: auto; border-radius: var(--r-md); border: 1px solid var(--line); }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; background: var(--surface); }
+  thead th {
+    padding: 10px 14px; text-align: left; white-space: nowrap;
+    font-size: 12px; letter-spacing: .4px; text-transform: uppercase;
+    color: var(--fg-3); background: var(--surface-2);
+    border-bottom: 1px solid var(--line);
+  }
+  tbody td { padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr { transition: background var(--t); }
+  tbody tr:hover { background: #fdf7fb; }
+  td button { padding: 5px 12px; font-size: 12.5px; border-radius: var(--r-sm); box-shadow: none; }
+  td button + button { margin-left: 6px; }
+
+  .muted { color: var(--fg-3); font-size: 12.5px; }
+
+  /* 提示条（原 #result，改为右上角浮层） */
+  #result {
+    display: none;
+    position: fixed; bottom: 20px; right: 20px; z-index: 50;
+    max-width: min(520px, calc(100vw - 32px));
+    padding: 12px 16px 12px 42px;
+    white-space: pre-wrap; font-size: 13px; font-weight: 500;
+    color: #14664a; background: #ecfdf5;
+    border: 1px solid rgba(31, 157, 107, .3);
+    border-left: 4px solid var(--ok);
+    border-radius: var(--r-md);
+    box-shadow: 0 10px 30px rgba(53, 36, 61, .16);
+    animation: toast-in 180ms ease-out both;
+  }
+  #result::before { content: "✅"; position: absolute; left: 14px; top: 11px; font-size: 14px; }
+  #result.error {
+    color: #8c1c39; background: #fff1f4;
+    border-color: rgba(209, 58, 99, .32);
+    border-left-color: var(--err);
+  }
+  #result.error::before { content: "⚠️"; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+
+  /* 用量条 */
+  .usage-track {
+    flex: 1; min-width: 180px; height: 10px; border-radius: var(--r-pill);
+    background: rgba(103, 58, 122, .1); overflow: hidden;
+  }
+  #usageFill { height: 100%; width: 0%; border-radius: var(--r-pill); background: var(--ok); transition: width .35s ease, background .35s ease; }
+  #usageText { font-size: 13px; }
+  #usageHint.warn { color: var(--warn); }
+  #usageHint.danger { color: var(--err); font-weight: 600; }
+
+  @media (max-width: 720px) {
+    body { padding: 12px 12px 28px; }
+    .card { padding: 16px; border-radius: var(--r-md); }
+    .topbar { padding: 12px 14px; }
+    .topbar-title { font-size: 16px; }
+    input[type="number"], input[type="text"] { width: 100%; min-width: 0; }
+  }
 </style>
 </head>
 <body>
-<h1>表情包管理后台</h1>
+<div class="topbar">
+  <span class="brand-dot"></span>
+  <div class="topbar-title">表情包管理后台</div>
+  <span class="pill">来只清楚 · 图库 / 备份 / 维护</span>
+</div>
 
 <div id="result"></div>
 
@@ -37,10 +216,12 @@
     <input type="text" id="adminInput" placeholder="输入管理员 QQ号 / openid">
     <button id="btnAddAdmin">添加</button>
   </div>
+  <div class="table-wrap">
   <table>
     <thead><tr><th>管理员 ID</th><th>操作</th></tr></thead>
     <tbody id="adminBody"></tbody>
   </table>
+  </div>
   <div class="row" style="margin-top:14px">
     <label>存储上限（MB）</label>
     <input type="number" id="mbInput" min="1">
@@ -55,8 +236,8 @@
   <div class="muted" style="margin-top:8px">添加/移除管理员会自动保存并立即生效；存储上限修改后点“保存配置”。</div>
   <div class="row" style="margin-top:12px; align-items:center">
     <span class="muted">图库用量</span>
-    <div style="flex:1; min-width:180px; height:10px; background:rgba(128,128,128,.2); border-radius:6px; overflow:hidden">
-      <div id="usageFill" style="height:100%; width:0%; background:#22c55e; transition:width .3s"></div>
+    <div class="usage-track">
+      <div id="usageFill"></div>
     </div>
     <strong id="usageText">-</strong>
   </div>
@@ -97,16 +278,18 @@
     <button id="btnRestore">上传并恢复</button>
   </div>
   <div class="row" style="margin-bottom:12px">
-    <input id="exportKeyword" placeholder="关键词（导出单个关键词，体积小、好下载）" style="min-width:260px">
+    <input id="exportKeyword" placeholder="关键词（导出为小卷）">
     <button id="btnExport" class="secondary">导出该关键词</button>
     <span class="muted">完整备份有 600MB 级，网络不稳时建议按关键词导出</span>
   </div>
   <div class="muted" style="margin-bottom:10px">恢复为合并式：重叠图片按 MD5 自动跳过；结果显示新增 / 覆盖 / 跳过 / 失败数量。</div>
   <div class="muted" style="margin-bottom:10px">⚠️ 恢复<b>不受存储上限约束</b>：恢复一个超过剩余额度的大包后，图库会超限，之后新增图片会被拒绝。恢复前请留意上方「图库用量」，必要时先调高上限或清理。</div>
+  <div class="table-wrap">
   <table>
     <thead><tr><th>备份文件</th><th>大小</th><th>创建时间</th><th>操作</th></tr></thead>
     <tbody id="backupBody"></tbody>
   </table>
+  </div>
 </div>
 
 <div class="card">
