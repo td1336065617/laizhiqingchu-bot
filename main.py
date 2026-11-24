@@ -23,6 +23,7 @@ import asyncio
 import hashlib
 import json
 import os
+from urllib.parse import quote
 import random
 import re
 import shutil
@@ -35,7 +36,12 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image, Reply
 from astrbot.api.star import Context, Star
-from astrbot.api.web import error_response, file_response, json_response, request
+from astrbot.api.web import (
+    error_response,
+    json_response,
+    request,
+    stream_response,
+)
 
 try:  # 同目录模块：包内导入时用相对导入，脚本/测试直跑时回落到绝对导入
     from . import sticker_store as _store_mod
@@ -311,6 +317,18 @@ class StickerPlugin(Star):
                 self._web_download,
                 ["GET"],
                 "下载表情包备份压缩包",
+            )
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/backup/download/url",
+                self._web_download_url,
+                ["GET"],
+                "返回下载绝对地址（供页面 fetch，拿真实接收进度）",
+            )
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/backup/download/progress",
+                self._web_download_progress,
+                ["GET"],
+                "下载进度（服务器已发送字节，供页面轮询）",
             )
             self.context.register_web_api(
                 f"/{PLUGIN_NAME}/backup/delete",
@@ -1598,9 +1616,95 @@ class StickerPlugin(Star):
             or target.suffix != ".zip"
         ):
             return error_response("备份文件不存在")
-        return file_response(
-            target, filename=target.name, content_type="application/zip"
+        # 前端拿不到浏览器原生下载进度（框架用 axios blob 通道），所以这里自己记账：
+        # 边发字节边更新 state，页面轮询 /backup/download/progress 画进度条。
+        size = target.stat().st_size
+        state = {
+            "filename": target.name,
+            "total": size,
+            "sent": 0,
+            "percent": 0,
+            "state": "downloading",
+            "started_at": time.time(),
+        }
+        self._download_state = state
+
+        quoted = quote(target.name)
+        return stream_response(
+            self._iter_backup_chunks(target, state),
+            content_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
+                "Content-Length": str(size),
+                "Accept-Ranges": "none",
+            },
         )
+
+    async def _iter_backup_chunks(self, target: Path, state: dict):
+        """按 1MB 分块吐出备份文件，并把已发送字节记进 state。"""
+        size = state.get("total") or 0
+        sent = 0
+        last_flush = 0.0
+        try:
+            with open(target, "rb") as handle:
+                while True:
+                    chunk = handle.read(1 << 20)
+                    if not chunk:
+                        break
+                    sent += len(chunk)
+                    now = time.time()
+                    if now - last_flush >= 0.2 or sent >= size:
+                        state.update(
+                            {
+                                "sent": sent,
+                                "percent": int(sent * 100 / size) if size else 100,
+                            }
+                        )
+                        last_flush = now
+                    yield chunk
+            state.update({"sent": sent, "percent": 100, "state": "done"})
+        except Exception as exc:  # 客户端断开也会走到这里
+            state.update({"state": "aborted", "error": str(exc)})
+            logger.info("下载中断（%s）：%s", target.name, exc)
+        finally:
+            state["finished_at"] = time.time()
+
+    async def _web_download_url(self):
+        """返回下载端点的绝对 URL，供页面自己 fetch（浏览器原生进度 / 真实接收字节）。
+
+        页面拿不到插件 API 的基址（由宿主拼装），所以由服务端按当前请求反推：
+        base_url + 当前路径去掉尾部 /url。
+        """
+        name = request.query.get("name", "")
+        target = (self.backup_root / Path(name).name).resolve()
+        if (
+            not name
+            or target.parent != self.backup_root.resolve()
+            or not target.is_file()
+            or target.suffix != ".zip"
+        ):
+            return error_response("备份文件不存在")
+        try:
+            base = str(request.base_url).rstrip("/")
+            path = str(request.path).removesuffix("/url")
+            url = f"{base}{path}?name={quote(target.name)}"
+        except Exception as exc:
+            logger.warning("构造下载 URL 失败: %s", exc)
+            return error_response("无法构造下载地址")
+        return json_response(
+            {
+                "status": "success",
+                "data": {
+                    "url": url,
+                    "filename": target.name,
+                    "size": target.stat().st_size,
+                },
+            }
+        )
+
+    async def _web_download_progress(self):
+        state = self.__dict__.get("_download_state") or {"state": "idle", "percent": 0}
+        return json_response({"status": "success", "data": state})
 
     async def _web_backup_delete(self):
         """删除备份列表中的指定压缩包（仅删除备份文件，不影响现有表情包数据）。"""

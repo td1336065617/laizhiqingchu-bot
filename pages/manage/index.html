@@ -192,6 +192,32 @@
   #usageHint.warn { color: var(--warn); }
   #usageHint.danger { color: var(--err); font-weight: 600; }
 
+  /* 下载进度面板（浏览器原生下载无进度可读，这里显示服务器已发送量） */
+  #dlPanel {
+    display: none;
+    position: fixed; left: 20px; bottom: 20px; z-index: 50;
+    width: min(420px, calc(100vw - 40px));
+    padding: 14px 16px;
+    background: #fff; border: 1px solid var(--line);
+    border-left: 4px solid var(--pink);
+    border-radius: var(--r-md);
+    box-shadow: 0 12px 34px rgba(53, 36, 61, .18);
+  }
+  #dlPanel .dl-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  #dlPanel .dl-title { font-weight: 700; font-size: 13px; margin-right: auto; }
+  #dlPanel .dl-note { font-size: 12px; color: var(--fg-3); margin-top: 6px; }
+  #dlBar { height: 8px; border-radius: var(--r-pill); background: rgba(103,58,122,.1); overflow: hidden; }
+  #dlFill { height: 100%; width: 0%; border-radius: var(--r-pill); background: linear-gradient(90deg, var(--pink), var(--ice)); transition: width .25s linear; }
+  #dlPanel.done { border-left-color: var(--ok); }
+  #dlPanel.aborted { border-left-color: var(--err); }
+  .spin {
+    width: 13px; height: 13px; border-radius: 50%;
+    border: 2px solid rgba(211,79,147,.25); border-top-color: var(--pink);
+    animation: spin .8s linear infinite; flex: 0 0 auto;
+  }
+  #dlPanel.done .spin, #dlPanel.aborted .spin { display: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
   @media (max-width: 720px) {
     body { padding: 12px 12px 28px; }
     .card { padding: 16px; border-radius: var(--r-md); }
@@ -209,6 +235,15 @@
 </div>
 
 <div id="result"></div>
+<div id="dlPanel">
+  <div class="dl-head">
+    <span class="spin"></span>
+    <span class="dl-title">下载中</span>
+    <span id="dlText" class="muted">准备中…</span>
+  </div>
+  <div id="dlBar"><div id="dlFill"></div></div>
+  <div class="dl-note">浏览器不会提供下载进度，这里显示服务器已发送的数据量</div>
+</div>
 
 <div class="card">
   <h2>管理员设置</h2>
@@ -425,6 +460,123 @@
     }
   }
 
+  function dlPanelRefs() {
+    const panel = document.getElementById('dlPanel');
+    return {
+      panel,
+      fill: document.getElementById('dlFill'),
+      text: document.getElementById('dlText'),
+      title: panel.querySelector('.dl-title'),
+    };
+  }
+
+  function dlRender(refs, state, received, total, startedAt) {
+    const pct = total > 0 ? Math.min(100, (received / total) * 100) : 0;
+    refs.fill.style.width = pct.toFixed(1) + '%';
+    const secs = Math.max(0.2, (Date.now() - startedAt) / 1000);
+    const gotMb = received / 1048576;
+    const allMb = total / 1048576;
+    if (state === 'done') {
+      refs.title.textContent = '下载完成';
+      refs.text.textContent = '已接收 ' + gotMb.toFixed(1) + ' MB，正在交给浏览器保存';
+      refs.panel.classList.add('done');
+      return;
+    }
+    if (state === 'aborted') {
+      refs.title.textContent = '下载中断';
+      refs.text.textContent = '已接收 ' + gotMb.toFixed(1) + ' / ' + allMb.toFixed(1) + ' MB';
+      refs.panel.classList.add('aborted');
+      return;
+    }
+    refs.title.textContent = '下载中';
+    refs.text.textContent =
+      pct.toFixed(1) + '% · ' + gotMb.toFixed(1) + ' / ' + allMb.toFixed(1) + ' MB · ' +
+      (gotMb / secs).toFixed(1) + ' MB/s';
+  }
+
+  function saveBlob(chunks, filename) {
+    const blob = new Blob(chunks, { type: 'application/zip' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+
+  async function startDownload(item) {
+    const refs = dlPanelRefs();
+    refs.panel.className = '';
+    refs.panel.style.display = 'block';
+    refs.fill.style.width = '0%';
+    refs.text.textContent = '准备中…';
+    const startedAt = Date.now();
+
+    if (item.size > 200 * 1024 * 1024) {
+      show('该备份 ' + fmtSize(item.size) + '，下载需保持网络稳定；中断需从头再来（可改用按关键词导出）', true);
+    }
+
+    // 优先：页面自己 fetch 同一地址，读到的是「真实接收字节」
+    let target = null;
+    try {
+      const info = await A.apiGet('backup/download/url', { name: item.filename });
+      target = info && info.url ? info.url : null;
+    } catch (e) {
+      target = null;
+    }
+
+    if (target && typeof fetch === 'function' && window.ReadableStream) {
+      const token = localStorage.getItem('token') || sessionStorage.getItem('token');
+      try {
+        const resp = await fetch(target, {
+          headers: token ? { Authorization: 'Bearer ' + token } : {},
+          cache: 'no-store',
+        });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const total = Number(resp.headers.get('content-length') || item.size || 0);
+        if (resp.body && resp.body.getReader) {
+          const reader = resp.body.getReader();
+          const chunks = [];
+          let received = 0;
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            received += value.byteLength;
+            dlRender(refs, 'downloading', received, total, startedAt);
+          }
+          dlRender(refs, 'done', received, total, startedAt);
+          saveBlob(chunks, item.filename);
+          setTimeout(() => { refs.panel.style.display = 'none'; }, 3000);
+          return;
+        }
+      } catch (e) {
+        // 拿不到流（鉴权/跨域/中断）就回退到桥接下载 + 服务端进度
+        console.warn('直连下载失败，回退桥接：', e);
+      }
+    }
+
+    // 回退：宿主桥接下载（无进度回调），改看服务端已发送量
+    A.download('backup/download', { name: item.filename }, item.filename);
+    for (let i = 0; i < 12000; i += 1) {
+      await new Promise((r) => setTimeout(r, 300));
+      let st = {};
+      try {
+        st = (await A.apiGet('backup/download/progress')) || {};
+      } catch (e) {
+        continue;
+      }
+      if (st.filename && st.filename !== item.filename) continue;
+      const sent = Number(st.sent || 0);
+      const total = Number(st.total || item.size || 0);
+      dlRender(refs, st.state === 'done' ? 'done' : (st.state === 'aborted' ? 'aborted' : 'downloading'), sent, total, startedAt);
+      if (st.state === 'done' || st.state === 'aborted') break;
+    }
+    setTimeout(() => { refs.panel.style.display = 'none'; }, 3000);
+  }
+
   async function refreshBackups() {
     try {
       const r = await A.apiGet('backups');
@@ -443,12 +595,7 @@
         const btn = document.createElement('button');
         btn.className = 'secondary';
         btn.textContent = '下载';
-        btn.onclick = () => {
-          if (item.size > 200 * 1024 * 1024) {
-            show('该备份 ' + fmtSize(item.size) + '，下载需保持网络稳定；中断需重新下载（可改用按关键词导出）', true);
-          }
-          A.download('backup/download', { name: item.filename }, item.filename);
-        };
+        btn.onclick = () => startDownload(item);
         td4.appendChild(btn);
         const delBtn = document.createElement('button');
         delBtn.className = 'danger';
