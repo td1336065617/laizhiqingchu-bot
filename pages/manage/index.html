@@ -302,6 +302,9 @@
     <label>单图上限（MB，0 = 不限）</label>
     <input type="number" id="maxImageInput" min="0" max="50">
     <button id="btnScan" class="secondary">扫描孤儿</button>
+    <button id="btnOrphan" class="secondary">回收孤儿</button>
+    <button id="btnQRestore" class="secondary">还原隔离</button>
+    <button id="btnQPrune" class="secondary">清隔离区</button>
     <button id="btnDedupe" class="secondary">去重（先干跑）</button>
   </div>
   <div class="row" style="margin-bottom:12px">
@@ -548,6 +551,75 @@
     setTimeout(() => { refs.panel.style.display = 'none'; }, 3000);
   }
 
+  async function orphanAction(action, payload, confirmWord) {
+    if (confirmWord) {
+      const ok = window.confirm(confirmWord);
+      if (!ok) return null;
+    }
+    const r = await A.apiPost('maintenance/orphans', Object.assign({ action: action }, payload || {}));
+    return r || {};
+  }
+
+  function orphanSummary(d) {
+    if (!d || d.error) return '操作失败：' + ((d && d.error) || '未知错误');
+    if (d.batches) {
+      return d.batches.length
+        ? ('隔离批次：\n' + d.batches.map((b) => b.batch + ' · ' + b.files + ' 个文件 · ' + b.mb + ' MB').join('\n'))
+        : '隔离区是空的';
+    }
+    const head = d.dry_run === false
+      ? ('已回收：' + (d.done || 0) + ' 个文件 / ' + (d.move_mb || 0) + ' MB' + ((d.failed || 0) ? ('失败 ' + d.failed) : ''))
+      : ('可回收：' + (d.files || 0) + ' 个文件 / ' + (d.move_mb || 0) + ' MB（点击「回收孤儿」再点一次执行）');
+    return head + (d.batch ? ('\n批次：' + d.batch) : '');
+  }
+
+  function bindOrphanButtons() {
+    const orphan = document.getElementById('btnOrphan');
+    if (orphan) {
+      let pending = false;
+      let timer = null;
+      const relabel = (text) => { orphan.textContent = text; };
+      const reset = () => { pending = false; relabel('回收孤儿'); if (timer) { clearTimeout(timer); timer = null; } };
+      orphan.onclick = async () => {
+        // 第二次点击直接执行：先判 pending，再判"有没有可回收"，否则执行分支永远走不到
+        if (!pending) {
+          const dry = await orphanAction('apply', { dry_run: true });
+          if (!dry || dry.error) { show(orphanSummary(dry), true); return; }
+          if ((dry.files || 0) === 0) { show('没有可回收的孤儿'); return; }
+          pending = true;
+          relabel('再点一次执行回收（10 秒内）');
+          show(orphanSummary(dry), false);
+          timer = setTimeout(reset, 10000);
+          return;
+        }
+        reset();
+        const done = await orphanAction('apply', { dry_run: false, confirm: 'orphans' }, '将把孤儿移到隔离区（可还原），继续？');
+        if (done) show(orphanSummary(done), !!(done.failed));
+      };
+    }
+
+    const restore = document.getElementById('btnQRestore');
+    if (restore) {
+      restore.onclick = async () => {
+        const listed = await orphanAction('list');
+        const batches = (listed && listed.batches) || [];
+        if (!batches.length) { show('隔离区是空的'); return; }
+        const latest = batches[batches.length - 1].batch;
+        const back = await orphanAction('restore', { batch: latest });
+        if (!back) return;
+        show('已还原 ' + (back.restored || 0) + ' 个文件' + ((back.skipped || 0) ? ('，跳过 ' + back.skipped + ' 个同名文件') : '') + '（批次 ' + latest + '）', !!(back.failed));
+      };
+    }
+
+    const prune = document.getElementById('btnQPrune');
+    if (prune) {
+      prune.onclick = async () => {
+        const done = await orphanAction('prune', { confirm: 'prune' }, '隔离区文件将永久删除（不可恢复），继续？');
+        if (done) show('已清空隔离区：' + (done.files || 0) + ' 个文件，释放 ' + (done.freed_mb || 0) + ' MB', !!(done.failed));
+      };
+    }
+  }
+
   async function refreshBackups() {
     try {
       const r = await A.apiGet('backups');
@@ -682,6 +754,8 @@
     }
   };
 
+  bindOrphanButtons();
+
   document.getElementById('btnScan').onclick = async () => {
     try {
       show('正在扫描...');
@@ -692,7 +766,11 @@
         '\n索引有磁盘无：' + ((d.index_only_keywords || []).join('、') || '无') +
         '\n缺失文件：' + (d.missing_files_total || 0) + ' 个' +
         '\n空目录：' + ((d.empty_dirs || []).join('、') || '无') +
-        '\n多余文件：' + (d.disk_orphan_files_total || 0) + ' 个'
+        '\n多余文件：' + (d.disk_orphan_files_total || 0) + ' 个' +
+        '\n孤儿占用：' + (d.orphan_mb || 0) + ' MB（其中内容唯一 ' + (d.orphan_unique_mb || 0) + ' MB 不可回收）' +
+        '\n去重残留 .lnk：' + (d.lnk_residue_total || 0) + ' 个' +
+        '\n符号链接（已跳过）：' + (d.symlinks_skipped || 0) + ' 个' +
+        '\n注意：隔离区文件仍占用磁盘与存储上限，需「清隔离区」才真正释放'
       );
     } catch (e) {
       show('扫描失败：' + (e && e.message ? e.message : e), true);

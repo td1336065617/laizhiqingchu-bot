@@ -27,6 +27,7 @@ from urllib.parse import quote
 import random
 import re
 import shutil
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -294,6 +295,12 @@ class StickerPlugin(Star):
                 ["GET"],
                 "孤儿对账：磁盘与索引双向差异（只读）",
             )
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/maintenance/orphans",
+                self._web_maintenance_orphans,
+                ["POST"],
+                "孤儿回收 / 还原 / 清空（action=scan/list/apply/restore/prune）",
+            ),
             self.context.register_web_api(
                 f"/{PLUGIN_NAME}/maintenance/dedupe",
                 self._web_maintenance_dedupe,
@@ -1569,6 +1576,56 @@ class StickerPlugin(Star):
             return error_response(f"扫描失败：{exc}")
         return json_response({"status": "success", "data": report})
 
+    async def _web_maintenance_orphans(self):
+        payload = await self._request_payload()
+        action = str((payload or {}).get("action") or "scan")
+        if action == "scan":
+            return json_response({"status": "success", "data": self._scan_orphans()})
+        if action == "list":
+            return json_response({"status": "success", "data": self._list_quarantine()})
+
+        try:
+            if action == "apply":
+                if str((payload or {}).get("confirm") or "") != "orphans":
+                    return error_response("回收孤儿需要二次确认（confirm=orphans）")
+                dry = (payload or {}).get("dry_run") is not False
+                data = await self._run_exclusive(self._quarantine_orphans, dry, "")
+                return json_response({"status": "success", "data": data})
+            if action == "restore":
+                batch = str((payload or {}).get("batch") or "")
+                if not batch:
+                    return error_response("缺少 batch")
+                data = await self._run_exclusive(self._restore_quarantine, batch)
+                return json_response({"status": "success", "data": data})
+            if action == "lnk":
+                # 去重中断留下的 *.lnk 是临时文件，可安全清理
+                if str((payload or {}).get("confirm") or "") != "lnk":
+                    return error_response("清理 .lnk 残留需要二次确认（confirm=lnk）")
+                removed = 0
+                for entry in self.data_dir.iterdir():
+                    if not entry.is_dir() or entry.name == self.QUARANTINE_DIR:
+                        continue
+                    for f in entry.iterdir():
+                        if f.is_file() and not f.is_symlink() and f.name.endswith(".lnk"):
+                            try:
+                                f.unlink()
+                                removed += 1
+                            except OSError as exc:
+                                logger.warning("清理 .lnk 失败（%s）: %s", f, exc)
+                return json_response({"status": "success", "data": {"removed": removed}})
+            if action == "prune":
+                if str((payload or {}).get("confirm") or "") != "prune":
+                    return error_response("删除隔离区不可恢复，需要二次确认（confirm=prune）")
+                batch = str((payload or {}).get("batch") or "")
+                data = await self._run_exclusive(self._prune_quarantine, batch)
+                return json_response({"status": "success", "data": data})
+        except ValueError as exc:
+            return error_response(str(exc))
+        except Exception as exc:
+            logger.error("孤儿维护失败: %s", exc, exc_info=True)
+            return error_response(f"操作失败：{exc}")
+        return error_response("未知 action")
+
     async def _web_maintenance_dedupe(self):
         payload = await request.json(default=None)
         want_apply = isinstance(payload, dict) and payload.get("apply") is True
@@ -1577,7 +1634,7 @@ class StickerPlugin(Star):
             return error_response("去重需要二次确认（confirm=dedupe）")
         dry_run = not want_apply
         try:
-            report = await asyncio.to_thread(self._dedupe_by_hardlink, dry_run)
+            report = await self._run_exclusive(self._dedupe_by_hardlink, dry_run)
         except Exception as exc:
             logger.error("去重失败: %s", exc, exc_info=True)
             return error_response(f"去重失败：{exc}")
@@ -1825,7 +1882,8 @@ class StickerPlugin(Star):
 
             def _wipe() -> None:
                 for child in list(self.data_dir.iterdir()):
-                    if child.is_dir():
+                    # 隔离区是"只隔离不删除"的保留副本，清空图库不能顺手销毁它
+                    if child.is_dir() and child.name != self.QUARANTINE_DIR:
                         shutil.rmtree(child)
 
             await asyncio.to_thread(_wipe)
@@ -2669,18 +2727,201 @@ class StickerPlugin(Star):
         return report
 
     # ---------------- 维护：孤儿对账 / 去重 ----------------
-    def _scan_orphans(self) -> dict:
-        """只读对账：磁盘有但索引没有、索引有但磁盘没有、空目录。"""
-        disk = {}
+    QUARANTINE_DIR = ".orphans"
+
+    def _maintenance_lock(self):
+        """去重/隔离/还原/清空互斥：两个改盘操作同时跑会互相把文件搬回去。
+
+        注意：这把锁**只能在工作线程里持有**。在事件循环线程里 `with` 跨 await 持锁，
+        第二个维护请求会阻塞整条循环，锁永远等不到释放（曾把进程挂死）。
+        """
+        lock = self.__dict__.get("_maintenance_mutex")
+        if lock is None:
+            lock = threading.Lock()
+            self._maintenance_mutex = lock
+        return lock
+
+    async def _run_exclusive(self, func, *args):
+        """在工作线程里持锁执行，避免事件循环线程持锁 + 并发互等。"""
+        lock = self._maintenance_lock()
+
+        def _call():
+            with lock:
+                return func(*args)
+
+        return await asyncio.to_thread(_call)
+
+    def _quarantine_root(self) -> Path:
+        return self.data_dir / self.QUARANTINE_DIR
+
+    def _quarantine_orphans(self, dry_run: bool = True, batch: str = "") -> dict:
+        """把孤儿移进隔离区（不删除）。默认干跑。
+
+        移动而非删除：孤儿大多是"文件已落盘、索引还没写"的半成品，
+        删掉等于丢图；隔离后可用 _restore_quarantine 原样搬回。
+        """
+        report = self._scan_orphans()
+        if report.get("error"):
+            return {"error": report["error"]}
+
+        # 执行时按磁盘全量重扫：展示用的 disk_orphan_files 有 [:200] 截断
+        items = []
         try:
             for entry in self.data_dir.iterdir():
-                if not entry.is_dir() or entry.name in ("__pycache__",):
+                if not entry.is_dir() or entry.name in ("__pycache__", self.QUARANTINE_DIR):
                     continue
+                for f in sorted(entry.iterdir()):
+                    if f.is_symlink() or not f.is_file() or f.name.endswith(".lnk"):
+                        continue
+                    if entry.name in self.index and f.name in self.index[entry.name]:
+                        continue
+                    items.append(f"{entry.name}/{f.name}")
+        except OSError as exc:
+            return {"error": str(exc)}
+        # 全盘重扫已覆盖"磁盘独有目录"，不再单独追加，否则同一文件会被计两次
+
+        stamp = batch or time.strftime("%Y%m%d_%H%M%S")
+        total_bytes = 0
+        for rel in items:
+            try:
+                total_bytes += (self.data_dir / rel).stat().st_size
+            except OSError:
+                pass
+
+        result = {
+            "dry_run": dry_run,
+            "batch": stamp,
+            "files": len(items),
+            "move_mb": round(total_bytes / 1048576, 1),
+            "items": items[:200],
+        }
+        if dry_run or not items:
+            return result
+
+        done, failed = 0, 0
+        target_root = self._quarantine_root() / stamp
+        for rel in items:
+            source = self.data_dir / rel
+            target = target_root / rel
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, target)
+                done += 1
+            except OSError as exc:
+                failed += 1
+                logger.warning("隔离孤儿失败（%s）: %s", rel, exc)
+        for keyword in report.get("disk_only_keywords") or []:
+            folder = self.data_dir / keyword
+            try:
+                if folder.is_dir() and not any(folder.iterdir()):
+                    folder.rmdir()
+            except OSError:
+                pass
+        result.update({"done": done, "failed": failed})
+        if done:
+            logger.info("已隔离 %d 个孤儿文件（%.1fMB）到 %s", done, result["move_mb"], stamp)
+        return result
+
+    def _list_quarantine(self) -> dict:
+        root = self._quarantine_root()
+        batches = []
+        if root.is_dir():
+            for entry in sorted(root.iterdir()):
+                if not entry.is_dir():
+                    continue
+                files = 0
+                total = 0
+                for f in entry.rglob("*"):
+                    if f.is_file():
+                        files += 1
+                        try:
+                            total += f.stat().st_size
+                        except OSError:
+                            pass
+                batches.append({"batch": entry.name, "files": files, "mb": round(total / 1048576, 1)})
+        return {"batches": batches}
+
+    def _restore_quarantine(self, batch: str) -> dict:
+        """把某批隔离文件原样搬回原位；同名已存在则跳过（不覆盖现有图）。"""
+        root = self._quarantine_root() / Path(batch).name
+        if not root.is_dir():
+            raise ValueError("隔离批次不存在")
+        restored, skipped, failed = 0, 0, 0
+        for f in sorted(root.rglob("*")):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(root)
+            target = self.data_dir / rel
+            try:
+                if target.exists():
+                    skipped += 1
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(f, target)
+                restored += 1
+            except OSError as exc:
+                failed += 1
+                logger.warning("还原隔离文件失败（%s）: %s", rel, exc)
+        try:
+            for d in sorted(root.rglob("*"), reverse=True):
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+            if root.is_dir() and not any(root.iterdir()):
+                root.rmdir()
+        except OSError:
+            pass
+        return {"restored": restored, "skipped": skipped, "failed": failed}
+
+    def _prune_quarantine(self, batch: str = "") -> dict:
+        """手动清空隔离区（用户选择永久保留，所以只能显式清）。"""
+        root = (self._quarantine_root() / Path(batch).name) if batch else self._quarantine_root()
+        if not root.is_dir():
+            raise ValueError("隔离区不存在")
+        files, total = 0, 0
+        for f in root.rglob("*"):
+            if f.is_file():
+                files += 1
                 try:
-                    files = [f.name for f in entry.iterdir() if f.is_file()]
+                    total += f.stat().st_size
+                except OSError:
+                    pass
+        shutil.rmtree(root)
+        logger.info("已清空隔离区 %s：%d 个文件，释放 %.1fMB", root.name, files, total / 1048576)
+        return {"files": files, "freed_mb": round(total / 1048576, 1)}
+
+    def _scan_orphans(self) -> dict:
+        """只读对账：磁盘有但索引没有、索引有但磁盘没有、空目录。
+
+        额外给出孤儿占用体积、内容唯一的孤儿体积（不可从别处恢复）、
+        以及去重崩溃残留的 *.lnk 数量——三者决定"能不能安全回收"。
+        """
+        disk = {}
+        sizes = {}
+        symlinks = 0
+        lnk_residue = []
+        try:
+            for entry in self.data_dir.iterdir():
+                if not entry.is_dir() or entry.name in ("__pycache__", self.QUARANTINE_DIR):
+                    continue
+                names = []
+                try:
+                    for f in entry.iterdir():
+                        if f.is_symlink():
+                            symlinks += 1
+                            continue          # 符号链接可能指向数据目录外，不纳入统计
+                        if not f.is_file():
+                            continue
+                        if f.name.endswith(".lnk"):
+                            lnk_residue.append(f"{entry.name}/{f.name}")
+                            continue          # 去重中断的临时文件，单独计数
+                        names.append(f.name)
+                        try:
+                            sizes[(entry.name, f.name)] = f.stat().st_size
+                        except OSError:
+                            pass
                 except OSError:
                     continue
-                disk[entry.name] = files
+                disk[entry.name] = names
         except OSError as exc:
             logger.error("扫描贴纸目录失败: %s", exc)
             return {"error": str(exc)}
@@ -2702,6 +2943,45 @@ class StickerPlugin(Star):
             extra = set(files) - set(indexed[keyword])
             for name in sorted(extra):
                 disk_orphan_files.append(f"{keyword}/{name}")
+        # 孤儿体积：① 已索引词内的多余文件 + ② 磁盘独有目录里的全部文件
+        # 已索引内容的 MD5 集合（用目录级缓存，避免为了统计把全库重算一遍）
+        indexed_md5 = set()
+        for keyword, names in indexed.items():
+            try:
+                mapping = self._folder_md5s(keyword)
+            except Exception as exc:
+                logger.warning("统计已索引 MD5 失败（%s）: %s", keyword, exc)
+                continue
+            # 只取索引真正引用的文件：目录里可能有孤儿，拿整目录会让孤儿"自己证明自己已存在"
+            for name in names:
+                digest = mapping.get(name)
+                if digest:
+                    indexed_md5.add(digest)
+        orphan_paths = []
+        for rel in disk_orphan_files:
+            keyword, _, name = rel.partition("/")
+            orphan_paths.append((keyword, name))
+        for keyword in disk_only_keywords:
+            for name in disk.get(keyword, []):
+                orphan_paths.append((keyword, name))
+        all_orphan_pairs = list(orphan_paths)   # 未截断，供执行用
+
+        orphan_bytes = 0
+        orphan_unique_bytes = 0
+        adoptable = []
+        for keyword, name in orphan_paths:
+            size = sizes.get((keyword, name), 0)
+            orphan_bytes += size
+            digest = None
+            try:
+                digest = self._md5(self.data_dir / keyword / name)
+            except OSError:
+                digest = None
+            if digest and digest in indexed_md5:
+                continue          # 内容在索引里已有：可安全回收/归并
+            orphan_unique_bytes += size
+            adoptable.append(f"{keyword}/{name}")
+
         empty_dirs = sorted(k for k, files in disk.items() if not files)
         return {
             "disk_only_keywords": disk_only_keywords,
@@ -2710,6 +2990,14 @@ class StickerPlugin(Star):
             "missing_files_total": len(missing_files),
             "disk_orphan_files": disk_orphan_files[:200],
             "disk_orphan_files_total": len(disk_orphan_files),
+            "orphan_mb": round(orphan_bytes / 1048576, 1),
+            "orphan_unique_mb": round(orphan_unique_bytes / 1048576, 1),
+            "all_orphan_count": len(all_orphan_pairs),   # 展示列表会截断，执行按这个数走
+            "orphan_adoptable": adoptable[:200],
+            "orphan_adoptable_total": len(adoptable),
+            "lnk_residue": lnk_residue[:50],
+            "lnk_residue_total": len(lnk_residue),
+            "symlinks_skipped": symlinks,
             "empty_dirs": empty_dirs,
         }
 
@@ -2719,18 +3007,41 @@ class StickerPlugin(Star):
         只链不删：每个关键词目录里的文件名都保留，索引零改动，可逆。
         """
         groups: dict = {}
+        try:
+            base_dev = self.data_dir.stat().st_dev
+        except OSError:
+            base_dev = None
+
+        # 范围：索引里的文件 + 孤儿（磁盘有、索引没引用）。
+        # 孤儿也参与分组，等于"内容重复的孤儿直接并到已有那份上"——只加链接不删文件。
+        candidates = []
         for keyword, names in self.index.items():
-            folder = self.data_dir / keyword
             for name in names:
-                path = folder / name
-                try:
-                    stat = path.stat()
-                except OSError:
+                candidates.append(self.data_dir / keyword / name)
+        try:
+            for entry in self.data_dir.iterdir():
+                if not entry.is_dir() or entry.name in ("__pycache__", self.QUARANTINE_DIR):
                     continue
-                if stat.st_nlink > 1:
-                    continue
-                key = (stat.st_size, self._md5(path))
-                groups.setdefault(key, []).append(path)
+                for f in entry.iterdir():
+                    if f.is_symlink() or not f.is_file() or f.name.endswith(".lnk"):
+                        continue
+                    if entry.name in self.index and f.name in self.index[entry.name]:
+                        continue          # 已在候选里
+                    candidates.append(f)
+        except OSError as exc:
+            logger.warning("枚举去重候选失败: %s", exc)
+
+        for path in candidates:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_nlink > 1:
+                continue                  # 已经是硬链接，无需再并
+            if base_dev is not None and stat.st_dev != base_dev:
+                continue                  # 跨设备不能硬链接
+            key = (stat.st_size, self._md5(path))
+            groups.setdefault(key, []).append(path)
 
         plans = []
         reclaimed = 0
@@ -2764,6 +3075,8 @@ class StickerPlugin(Star):
             for rel in item["linked"]:
                 target = self.data_dir / rel
                 try:
+                    if keep.stat().st_dev != target.stat().st_dev:
+                        raise OSError("跨设备，无法硬链接")
                     tmp = target.with_suffix(target.suffix + ".lnk")
                     if tmp.exists():
                         tmp.unlink()
