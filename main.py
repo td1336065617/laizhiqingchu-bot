@@ -79,6 +79,9 @@ FORWARD_NESTED_KEYS = ("msg_elements", "elements", "messages", "nodes", "records
 PAGE_SIZE = 10
 # 默认存储上限（MB），可通过 _conf_schema.json 的 max_storage_mb 覆盖
 DEFAULT_MAX_STORAGE_MB = 200
+# 默认备份保留：份数上限与总量上限（MB）。pre-restore_* 永不参与自动清理
+DEFAULT_BACKUP_KEEP = 2
+DEFAULT_BACKUP_TOTAL_MB = 1024
 # 允许保留的图片扩展名（convert_to_file_path 可能返回无后缀的临时文件）
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
@@ -1076,6 +1079,9 @@ class StickerPlugin(Star):
                         str(a) for a in (self.config.get("admin_users", []) or [])
                     ],
                     "max_storage_mb": self._max_storage_mb(),
+                    "backup_keep": self._backup_keep(),
+                    "backup_total_mb": self._backup_total_mb(),
+                    "storage": self._storage_usage(),
                     "ai": self._ai_settings(),
                 },
             }
@@ -1099,6 +1105,20 @@ class StickerPlugin(Star):
             )
         except (TypeError, ValueError):
             return DEFAULT_MAX_STORAGE_MB
+
+    def _backup_keep(self) -> int:
+        try:
+            value = int(self.config.get("backup_keep", DEFAULT_BACKUP_KEEP))
+        except (TypeError, ValueError):
+            return DEFAULT_BACKUP_KEEP
+        return value if 1 <= value <= 20 else DEFAULT_BACKUP_KEEP
+
+    def _backup_total_mb(self) -> int:
+        try:
+            value = int(self.config.get("backup_total_mb", DEFAULT_BACKUP_TOTAL_MB))
+        except (TypeError, ValueError):
+            return DEFAULT_BACKUP_TOTAL_MB
+        return value if 100 <= value <= 20000 else DEFAULT_BACKUP_TOTAL_MB
 
     def _storage_usage(self) -> dict:
         """全仓唯一的用量口径：贴纸库 + 备份目录分开统计。
@@ -1195,6 +1215,24 @@ class StickerPlugin(Star):
                 raise ValueError("max_storage_mb 必须大于 0")
             self.config["max_storage_mb"] = limit
             updated["max_storage_mb"] = limit
+        if "backup_keep" in payload:
+            try:
+                keep = int(payload["backup_keep"])
+            except (TypeError, ValueError):
+                raise ValueError("backup_keep 必须是整数")
+            if not 1 <= keep <= 20:
+                raise ValueError("backup_keep 必须在 1~20 之间")
+            self.config["backup_keep"] = keep
+            updated["backup_keep"] = keep
+        if "backup_total_mb" in payload:
+            try:
+                total_mb = int(payload["backup_total_mb"])
+            except (TypeError, ValueError):
+                raise ValueError("backup_total_mb 必须是整数")
+            if not 100 <= total_mb <= 20000:
+                raise ValueError("backup_total_mb 必须在 100~20000 之间")
+            self.config["backup_total_mb"] = total_mb
+            updated["backup_total_mb"] = total_mb
         ai_patch = payload.get("ai")
         if isinstance(ai_patch, dict):
             updated["ai"] = self._apply_ai_payload(ai_patch)
@@ -1308,6 +1346,17 @@ class StickerPlugin(Star):
         )
         try:
             await upload.save(tmp_path)
+            # 恢复是不可逆操作：先留一份快照，快照失败就中止（宁可不恢复）
+            try:
+                pre = self._backup_to_zip(prefix="pre-restore")
+                logger.info(
+                    "恢复前已自动备份：%s（%.1fMB）",
+                    pre["filename"],
+                    pre["size"] / 1048576,
+                )
+            except Exception as exc:
+                logger.error("恢复前备份失败，已中止恢复: %s", exc, exc_info=True)
+                return error_response(f"恢复已中止：恢复前备份失败（{exc}）")
             stats = self._restore_from_zip(tmp_path)
         except Exception as exc:
             logger.error("恢复备份失败: %s", exc, exc_info=True)
@@ -1352,15 +1401,19 @@ class StickerPlugin(Star):
             }
         )
 
-    def _backup_to_zip(self) -> dict:
-        """把当前全部表情包数据打包为 zip（含 manifest 校验清单）。"""
+    def _backup_to_zip(self, prefix: str = "sticker_backup") -> dict:
+        """把当前全部表情包数据打包为 zip（含 manifest 校验清单）。
+
+        prefix 用于区分自动备份（sticker_backup_*）与恢复前快照（pre-restore_*）。
+        用 ZIP_STORED：图片本身已压缩，实测压缩比 0.96，DEFLATE 只烧 CPU（637MB 约 15s → 约 1.5s）。
+        """
         self.backup_root.mkdir(parents=True, exist_ok=True)
         filename = (
-            f"sticker_backup_{time.strftime('%Y%m%d_%H%M%S')}_{random.randint(1000, 9999)}.zip"
+            f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}_{random.randint(1000, 9999)}.zip"
         )
         target = self.backup_root / filename
         files_meta = []
-        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_STORED) as zf:
             zf.writestr(
                 "index.json",
                 json.dumps(self.index, ensure_ascii=False, indent=2),
@@ -1392,12 +1445,88 @@ class StickerPlugin(Star):
                     indent=2,
                 ),
             )
+        # 生成后立刻按策略清理：本次刚生成的这份永不删
+        removed = self._prune_backups(keep_name=filename)
         return {
             "filename": filename,
             "size": target.stat().st_size,
             "keywords": len(self.index),
             "images": len(files_meta),
+            "pruned": removed,
         }
+
+    def _prune_backups(self, keep_name: Optional[str] = None) -> List[str]:
+        """按份数与总量清理备份，返回被删文件名列表。
+
+        保护名单：keep_name（本次刚生成）与 pre-restore_*（恢复前快照，只能人工删）。
+        """
+        try:
+            backups = [p for p in self.backup_root.glob("*.zip") if p.is_file()]
+        except OSError:
+            return []
+        protected = {name for name in (keep_name,) if name}
+        removed: List[str] = []
+        # pre-restore_* 不参与常规淘汰，但只保留最新一份：
+        # 否则每次恢复都多 600MB 级快照，磁盘会被快照吃满（线上剩余空间 <5GB）。
+        snapshots = sorted(
+            (p for p in backups if p.name.startswith("pre-restore")),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+        )
+        for stale_snapshot in snapshots[:-1]:
+            try:
+                stale_snapshot.unlink()
+            except OSError as exc:
+                logger.warning("删除旧恢复快照失败（%s）: %s", stale_snapshot.name, exc)
+                continue
+            backups.remove(stale_snapshot)
+            removed.append(stale_snapshot.name)
+        protected.update(p.name for p in backups if p.name.startswith("pre-restore"))
+
+        def _size(path: Path) -> int:
+            try:
+                return path.stat().st_size
+            except OSError:
+                return 0
+
+        backups.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+        keep = self._backup_keep()
+        total_limit = self._backup_total_mb() * 1024 * 1024
+
+        def _victim() -> Optional[Path]:
+            for candidate in backups:
+                if candidate.name not in protected:
+                    return candidate
+            return None
+
+        while len(backups) > keep:
+            victim = _victim()
+            if victim is None:
+                break
+            backups.remove(victim)
+            try:
+                victim.unlink()
+            except OSError as exc:
+                logger.warning("删除旧备份失败（%s）: %s", victim.name, exc)
+                continue
+            removed.append(victim.name)
+
+        while sum(_size(p) for p in backups) > total_limit:
+            victim = _victim()
+            if victim is None:
+                break
+            backups.remove(victim)
+            try:
+                victim.unlink()
+            except OSError as exc:
+                logger.warning("删除旧备份失败（%s）: %s", victim.name, exc)
+                continue
+            removed.append(victim.name)
+
+        if removed:
+            logger.info("按保留策略清理备份 %d 份: %s", len(removed), ", ".join(removed))
+        elif not backups:
+            logger.info("保留策略：无备份可清理")
+        return removed
 
     def _restore_from_zip(self, zip_path: Path) -> dict:
         """校验备份压缩包并合并恢复；重叠图片按 MD5 跳过。"""

@@ -49,6 +49,7 @@ def make_bot(tmp_path):
     bot = main.StickerPlugin.__new__(main.StickerPlugin)
     bot.config = main._PluginConfig(tmp_path / "config.json")
     bot.data_dir = tmp_path
+    bot.backup_root = tmp_path / "sticker_backups"
     bot.index = {}
     bot.blocked_keywords = set()
     bot._ai_throttle = None
