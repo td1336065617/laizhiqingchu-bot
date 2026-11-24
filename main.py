@@ -67,6 +67,9 @@ RESERVED_KEYWORDS = {
     "屏蔽",
     "屏蔽列表",
     "解除屏蔽",
+    "绑定",
+    "解绑",
+    "别名",
 }
 # 二次删除确认的有效期（秒）
 CONFIRM_TTL = 60
@@ -233,6 +236,11 @@ class StickerPlugin(Star):
         self._store = None
         # 顺序要紧：先读 JSON（迁移源），再决定用 SQLite 还是继续纯 JSON
         self._load_index()
+        # 别名组：{主词: [别名...]}（旁挂文件，不进 index.json）
+        self.alias_path = self.data_dir / "keyword_groups.json"
+        self.alias_groups: dict = {}
+        self.alias_map: dict = {}
+        self._load_groups()
         self._init_storage()
         self._load_blocked()
         self._check_storage()
@@ -388,6 +396,15 @@ class StickerPlugin(Star):
             elif message_str.startswith("表情包管理菜单"):
                 async for result in self._handle_menu(event, message_str):
                     yield result
+            elif message_str.startswith("绑定"):
+                async for result in self._handle_bind(event, message_str):
+                    yield result
+            elif message_str.startswith("解绑"):
+                async for result in self._handle_unbind(event, message_str):
+                    yield result
+            elif message_str.startswith("别名"):
+                async for result in self._handle_alias_list(event, message_str):
+                    yield result
             elif message_str.startswith("屏蔽列表"):
                 async for result in self._handle_block_list(event, message_str):
                     yield result
@@ -407,6 +424,11 @@ class StickerPlugin(Star):
     # ------------------------------------------------------------------
     async def _handle_add(self, event: AstrMessageEvent, message_str: str):
         keyword = message_str[2:].strip()
+        raw_keyword = keyword
+        keyword, _how = self._resolve_keyword(raw_keyword)
+        if not keyword:
+            yield event.plain_result('关键词 ' + raw_keyword + ' 不存在')
+            return
         if not keyword:
             yield event.plain_result("用法：添加{关键词}（请回复包含图片的消息）")
             return
@@ -461,7 +483,10 @@ class StickerPlugin(Star):
         self, event: AstrMessageEvent, message_str: str
     ):
         """批量添加合并转发：先发送命令，90 秒内本人发送的合并转发自动入库。"""
-        keyword = message_str[len("批量添加合并转发") :].strip()
+        raw_keyword = message_str[len("批量添加合并转发") :].strip()
+        keyword, _how = self._resolve_keyword(raw_keyword)
+        if not keyword:
+            yield event.plain_result("关键词 " + raw_keyword + " 不存在，请先用 添加 建立")
         if not keyword:
             yield event.plain_result("用法：批量添加合并转发{关键词}")
             return
@@ -550,6 +575,11 @@ class StickerPlugin(Star):
     # ------------------------------------------------------------------
     async def _handle_send(self, event: AstrMessageEvent, message_str: str):
         keyword = message_str[2:].strip()
+        raw_keyword = keyword
+        keyword, _how = self._resolve_keyword(raw_keyword)
+        if not keyword:
+            yield event.plain_result('关键词 ' + raw_keyword + ' 不存在')
+            return
         if not keyword:
             yield event.plain_result("用法：来只{关键词}")
             return
@@ -623,6 +653,11 @@ class StickerPlugin(Star):
             return
 
         rest = message_str[2:].strip()
+        raw_keyword = rest
+        rest, _how = self._resolve_keyword(raw_keyword)
+        if not rest:
+            yield event.plain_result('关键词 ' + raw_keyword + ' 不存在')
+            return
         match = re.search(r"(\d+)\s*$", rest)
         if not match:
             yield event.plain_result("用法：删图（回复要删除的图片），或删图{关键词}{序号}")
@@ -673,6 +708,11 @@ class StickerPlugin(Star):
         不带关键词时自动在所有关键词中定位；带关键词时仅在该关键词下删除。
         """
         keyword = message_str[2:].strip()
+        raw_keyword = keyword
+        keyword, _how = self._resolve_keyword(raw_keyword)
+        if not keyword:
+            yield event.plain_result('关键词 ' + raw_keyword + ' 不存在')
+            return
         if keyword and not self._is_valid_keyword(keyword):
             yield event.plain_result("关键词不合法（不能是 Windows 保留名，结尾也不能带点或空格）")
             return
@@ -774,6 +814,11 @@ class StickerPlugin(Star):
             return
 
         keyword = message_str[2:].strip()
+        raw_keyword = keyword
+        keyword, _how = self._resolve_keyword(raw_keyword)
+        if not keyword:
+            yield event.plain_result('关键词 ' + raw_keyword + ' 不存在')
+            return
         if not keyword:
             yield event.plain_result("用法：删除{关键词}")
             return
@@ -951,6 +996,8 @@ class StickerPlugin(Star):
         if blocked:
             return blocked
         keyword = ai_impl.keyword_or_empty((kwargs or {}).get("keyword"))
+        resolved, _alias_how = self._resolve_keyword(keyword)
+        keyword = resolved or keyword  # 未知关键词保留原值，交给下游给候选提示
         if not keyword:
             return ai_common.fail("invalid_argument", "缺少 keyword（表情包关键词）", field="keyword")
         reason = ai_impl.block_reason(keyword, self.blocked_keywords)
@@ -1043,6 +1090,8 @@ class StickerPlugin(Star):
         if not self._is_admin(event):
             return ai_common.fail("permission_denied", "列表仅管理员可用")
         keyword = ai_impl.keyword_or_empty((kwargs or {}).get("keyword"))
+        resolved, _alias_how = self._resolve_keyword(keyword)
+        keyword = resolved or keyword  # 未知关键词保留原值，交给下游给候选提示
         if not keyword:
             return ai_common.fail("invalid_argument", "缺少 keyword（表情包关键词）", field="keyword")
         reason = ai_impl.block_reason(keyword, self.blocked_keywords)
@@ -1584,6 +1633,28 @@ class StickerPlugin(Star):
                 "blocked_keywords.json",
                 json.dumps(sorted(self.blocked_keywords), ensure_ascii=False, indent=2),
             )
+            # 别名表：只导单个关键词时也带上它的组，恢复后别名不丢
+            groups = self.__dict__.get("alias_groups") or {}
+            if only_keyword:
+                groups = (
+                    {only_keyword: groups[only_keyword]}
+                    if only_keyword in groups
+                    else {}
+                )
+            zf.writestr(
+                "aliases.json",
+                json.dumps(
+                    {
+                        "version": 1,
+                        "groups": {
+                            primary: {"primary": primary, "aliases": list(aliases)}
+                            for primary, aliases in groups.items()
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
             done_since_flush = 0
             last_flush = time.time()
             for keyword, names in payload_index.items():
@@ -1733,6 +1804,38 @@ class StickerPlugin(Star):
             logger.info("保留策略：无备份可清理")
         return removed
 
+    def _merge_aliases(self, groups: dict, restored_keywords: set) -> int:
+        """把备份里的别名合并进当前别名表；主词必须存在（本次恢复或已有）。"""
+        if not isinstance(groups, dict):
+            return 0
+        merged = 0
+        self.alias_groups = self.__dict__.get("alias_groups") or {}
+        known = set(self.index) | set(restored_keywords)
+        for primary, payload in groups.items():
+            primary = str(primary)
+            if primary not in known:
+                logger.warning("备份里的别名组主词 %s 不存在，跳过", primary)
+                continue
+            aliases = []
+            if isinstance(payload, dict):
+                aliases = [str(a).strip() for a in (payload.get("aliases") or [])]
+            elif isinstance(payload, list):
+                aliases = [str(a).strip() for a in payload]
+            bucket = self.alias_groups.setdefault(primary, [])
+            for alias in aliases:
+                if not alias or alias == primary or alias in self.index:
+                    continue
+                if alias not in bucket:
+                    bucket.append(alias)
+                    merged += 1
+        self._refresh_alias_map()
+        if merged:
+            try:
+                self._save_groups()
+            except OSError as exc:
+                logger.error("保存合并后的别名表失败: %s", exc)
+        return merged
+
     def _restore_from_zip(self, zip_path: Path) -> dict:
         """校验备份压缩包并合并恢复；重叠图片按 MD5 跳过。"""
         try:
@@ -1842,8 +1945,19 @@ class StickerPlugin(Star):
                 self._save_blocked()
             self._save_index()
 
+            # 别名表：v2 包才可能有；缺失视为"无别名"，不影响 v1 恢复
+            aliases_merged = 0
+            if "aliases.json" in members:
+                try:
+                    payload = json.loads(zf.read("aliases.json").decode("utf-8"))
+                    groups = payload.get("groups") if isinstance(payload, dict) else None
+                    aliases_merged = self._merge_aliases(groups or {}, set(archive_index))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    logger.warning("备份里的 aliases.json 无法解析，已跳过：%s", exc)
+
         return {
             "archive_keywords": len(archive_index),
+            "aliases_merged": aliases_merged,
             "archive_images": archive_images,
             "added": added,
             "skipped": skipped,
@@ -1860,12 +1974,121 @@ class StickerPlugin(Star):
     # ------------------------------------------------------------------
     # H. 屏蔽关键词（仅管理员）
     # ------------------------------------------------------------------
+    # ---------------- 别名组指令 ----------------
+    async def _handle_bind(self, event: AstrMessageEvent, message_str: str):
+        """绑定{别名}到{主词}：单层多对一，别名不得当组名。"""
+        if not self._is_admin(event):
+            yield event.plain_result("此指令仅限管理员")
+            return
+        payload = message_str[len("绑定") :].strip()
+        if "到" not in payload:
+            yield event.plain_result("用法：绑定{别名}到{主词}")
+            return
+        alias, primary = (part.strip() for part in payload.split("到", 1))
+        if not alias or not primary:
+            yield event.plain_result("用法：绑定{别名}到{主词}")
+            return
+        if alias == primary:
+            yield event.plain_result("别名与主词相同，无需绑定")
+            return
+        if not self._is_valid_keyword(alias) or not self._is_valid_keyword(primary):
+            yield event.plain_result(
+                "关键词不合法（不能是保留指令名、Windows 保留名，结尾也不能带点或空格）"
+            )
+            return
+        if primary in self.alias_map:
+            yield event.plain_result(
+                f"{primary} 本身是 {self.alias_map[primary]} 的别名，别名不能再作为主词"
+            )
+            return
+        if primary not in self.index:
+            yield event.plain_result(f"主词 {primary} 下不存在图片，请先添加")
+            return
+        if alias in self.index:
+            yield event.plain_result(f"{alias} 已经是真实关键词，别名不能与它同名")
+            return
+        if alias in self.alias_map:
+            current = self.alias_map[alias]
+            if current == primary:
+                yield event.plain_result(f"{alias} 已经绑定到 {primary}")
+                return
+            yield event.plain_result(
+                f"{alias} 已绑定到 {current}，请先执行 解绑{alias}"
+            )
+            return
+        self.alias_groups.setdefault(primary, [])
+        if alias not in self.alias_groups[primary]:
+            self.alias_groups[primary].append(alias)
+        self._refresh_alias_map()
+        try:
+            self._save_groups()
+        except OSError as exc:
+            logger.error("保存别名表失败: %s", exc)
+            yield event.plain_result(f"保存别名失败：{exc}")
+            return
+        yield event.plain_result(f"已绑定：{alias} → {primary}（来只{alias} 等同 来只{primary}）")
+
+    async def _handle_unbind(self, event: AstrMessageEvent, message_str: str):
+        if not self._is_admin(event):
+            yield event.plain_result("此指令仅限管理员")
+            return
+        alias = message_str[len("解绑") :].strip()
+        if not alias:
+            yield event.plain_result("用法：解绑{别名}")
+            return
+        primary = self.alias_map.get(alias)
+        if not primary:
+            yield event.plain_result(f"{alias} 不是任何关键词的别名")
+            return
+        aliases = self.alias_groups.get(primary) or []
+        if alias in aliases:
+            aliases.remove(alias)
+        if not aliases:
+            self.alias_groups.pop(primary, None)
+        self._refresh_alias_map()
+        try:
+            self._save_groups()
+        except OSError as exc:
+            logger.error("保存别名表失败: %s", exc)
+            yield event.plain_result(f"保存别名失败：{exc}")
+            return
+        yield event.plain_result(f"已解绑：{alias}")
+
+    async def _handle_alias_list(self, event: AstrMessageEvent, message_str: str):
+        keyword = message_str[len("别名") :].strip()
+        if not keyword:
+            if not self.alias_groups:
+                yield event.plain_result("还没有任何别名绑定")
+                return
+            lines = ["别名总览："]
+            for primary, aliases in sorted(self.alias_groups.items()):
+                lines.append(f"- {primary} ← {('、'.join(aliases))}")
+            yield event.plain_result("\n".join(lines))
+            return
+        keyword, how = self._resolve_keyword(keyword)
+        if not keyword:
+            yield event.plain_result(f"关键词 {message_str[len('别名'):].strip()} 不存在")
+            return
+        aliases = self.alias_groups.get(keyword) or []
+        if not aliases:
+            yield event.plain_result(f"{keyword} 没有别名")
+            return
+        note = "" if how == "exact" else "（按别名解析）"
+        yield event.plain_result(
+            f"{keyword}{note} 的别名：{'、'.join(aliases)}"
+        )
+
     async def _handle_block(self, event: AstrMessageEvent, message_str: str):
         if not self._is_admin(event):
             yield event.plain_result("此指令仅限管理员")
             return
 
         keyword = message_str[2:].strip()
+        raw_keyword = keyword
+        keyword, _how = self._resolve_keyword(raw_keyword)
+        if not keyword:
+            yield event.plain_result('关键词 ' + raw_keyword + ' 不存在')
+            return
         if not keyword:
             yield event.plain_result("用法：屏蔽{关键词}")
             return
@@ -2247,6 +2470,60 @@ class StickerPlugin(Star):
             self._store = None
             # DB 载入可能已覆盖过内存索引：回落时以 JSON 为准重新读一次
             self._load_index()
+
+    # ---------------- 别名组 ----------------
+    def _load_groups(self) -> None:
+        """读取 keyword_groups.json；损坏时按"无别名"处理，不阻塞启动。"""
+        self.alias_groups = {}
+        try:
+            if self.alias_path.exists():
+                raw = json.loads(self.alias_path.read_text(encoding="utf-8"))
+                groups = (raw or {}).get("groups") if isinstance(raw, dict) else None
+                if isinstance(groups, dict):
+                    for primary, payload in groups.items():
+                        aliases = []
+                        if isinstance(payload, dict):
+                            aliases = [
+                                str(a).strip()
+                                for a in (payload.get("aliases") or [])
+                                if str(a).strip() and str(a).strip() != primary
+                            ]
+                        if aliases:
+                            self.alias_groups[str(primary)] = aliases
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.error("读取别名表失败（按无别名处理）: %s", exc)
+        self._refresh_alias_map()
+
+    def _refresh_alias_map(self) -> None:
+        mapping = {}
+        for primary, aliases in self.alias_groups.items():
+            for alias in aliases:
+                mapping[alias] = primary
+        self.alias_map = mapping
+
+    def _save_groups(self) -> None:
+        payload = {
+            "version": 1,
+            "groups": {
+                primary: {"primary": primary, "aliases": list(aliases)}
+                for primary, aliases in self.alias_groups.items()
+            },
+        }
+        _atomic_write_json(self.alias_path, payload)
+
+    def _resolve_keyword(self, raw: str):
+        """唯一解析口：真关键词优先，其次别名。返回 (关键词或 None, 方式)。"""
+        text = (raw or "").strip()
+        if not text:
+            return None, "empty"
+        index = getattr(self, "index", None) or {}
+        alias_map = getattr(self, "alias_map", None) or {}
+        if text in index:
+            return text, "exact"
+        target = alias_map.get(text)
+        if target and target in index:
+            return target, "alias"
+        return None, "unknown"
 
     def _load_index(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
